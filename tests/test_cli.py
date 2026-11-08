@@ -239,6 +239,20 @@ class TestCardGet:
             data = json.loads(result.stderr)
             assert data["error"] == "card_not_found"
 
+    def test_get_preserves_angle_brackets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            _init_db(db_path)
+            card_id = _add_card(
+                db_path, "List<int> vs IEnumerable<T>", "Dictionary<string, List<int>> x;"
+            )
+
+            result = _run(["card", "get", str(card_id)], db_path)
+            assert result.returncode == 0
+            data = json.loads(result.stdout)
+            assert data["question"] == "List<int> vs IEnumerable<T>"
+            assert data["answer"] == "Dictionary<string, List<int>> x;"
+
 
 class TestCardHistory:
     def test_history_with_reviews(self) -> None:

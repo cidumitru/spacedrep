@@ -649,6 +649,20 @@ def test_open_deck_force_overrides_safety(tmp_db: Path, cloze_apkg: Path) -> Non
     assert result.card_count == 2
 
 
+def test_open_deck_html_fields_still_stripped(tmp_db: Path, html_apkg: Path) -> None:
+    """Notes under Anki's own note types hold HTML and keep rendering stripped."""
+    core.open_deck(tmp_db, html_apkg, force=True)
+    basic = core.get_card_detail(tmp_db, 20)
+    assert (basic.question, basic.answer) == ("bold x", "back")
+    forward = core.get_card_detail(tmp_db, 21)
+    assert (forward.question, forward.answer) == ("bold x", "italic")
+    reverse = core.get_card_detail(tmp_db, 22)
+    assert (reverse.question, reverse.answer) == ("italic", "bold x")
+    cloze = core.get_card_detail(tmp_db, 23)
+    assert (cloze.question, cloze.answer) == ("[...] text", "bold text")
+    assert cloze.extra_fields == {"Extra": "extra"}
+
+
 # --- Cloze creation tests ---
 
 
@@ -1628,3 +1642,46 @@ class TestCreatedAtStability:
         for b, a in zip(before, after, strict=True):
             assert b is not None and a is not None
             assert a.created_at == b.created_at
+
+
+# ---------------------------------------------------------------------------
+# Plain-text rendering of spacedrep-authored notes
+# ---------------------------------------------------------------------------
+
+_GENERIC_Q = "List<int> vs IEnumerable<T>"
+_GENERIC_A = "Dictionary<string, List<int>> x;"
+
+
+class TestPlainTextRendering:
+    def test_basic_card_verbatim_on_every_read(self, tmp_db: Path) -> None:
+        card_id = int(core.add_card(tmp_db, _GENERIC_Q, _GENERIC_A, deck="d")["card_id"])
+
+        detail = core.get_card_detail(tmp_db, card_id)
+        assert (detail.question, detail.answer) == (_GENERIC_Q, _GENERIC_A)
+
+        due = core.get_next_card(tmp_db)
+        assert due is not None
+        assert (due.question, due.answer) == (_GENERIC_Q, _GENERIC_A)
+
+        assert [c.question for c in core.list_cards(tmp_db).cards] == [_GENERIC_Q]
+
+    def test_search_matches_angle_brackets(self, tmp_db: Path) -> None:
+        card_id = int(core.add_card(tmp_db, _GENERIC_Q, _GENERIC_A, deck="d")["card_id"])
+        core.add_card(tmp_db, "List of ints", "IEnumerable", deck="d")
+
+        result = core.list_cards(tmp_db, search="List<int>")
+        assert result.total == 1
+        assert [c.card_id for c in result.cards] == [card_id]
+
+    def test_cloze_note_verbatim(self, tmp_db: Path) -> None:
+        r = core.add_cloze_note(tmp_db, "{{c1::Func<int>}} is a delegate", deck="d")
+        detail = core.get_card_detail(tmp_db, r.card_ids[0])
+        assert detail.question == "[...] is a delegate"
+        assert detail.answer == "Func<int> is a delegate"
+
+    def test_reversed_note_verbatim_both_directions(self, tmp_db: Path) -> None:
+        r = core.add_reversed_card(tmp_db, _GENERIC_Q, _GENERIC_A, deck="d")
+        forward = core.get_card_detail(tmp_db, r.card_ids[0])
+        reverse = core.get_card_detail(tmp_db, r.card_ids[1])
+        assert (forward.question, forward.answer) == (_GENERIC_Q, _GENERIC_A)
+        assert (reverse.question, reverse.answer) == (_GENERIC_A, _GENERIC_Q)

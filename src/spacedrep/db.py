@@ -25,6 +25,7 @@ from spacedrep.anki_schema import (
     ANKI_SCHEMA,
     BASIC_MODEL_ID,
     BASIC_REVERSED_MODEL_ID,
+    CLOZE_MODEL_ID,
     ColMeta,
     anki_fields_to_fsrs_card,
     due_to_datetime,
@@ -173,6 +174,12 @@ def _get_crt(conn: sqlite3.Connection) -> int:
 
 _model_cache: dict[int, dict[str, ModelInfo]] = {}
 
+# spacedrep writes its own notes as plain text under these note types; any other
+# note type came from Anki, whose fields are HTML.
+_PLAIN_TEXT_MODEL_IDS = frozenset(
+    str(mid) for mid in (BASIC_MODEL_ID, CLOZE_MODEL_ID, BASIC_REVERSED_MODEL_ID)
+)
+
 
 def is_modern_anki_schema(conn: sqlite3.Connection) -> bool:
     """True iff col.models is empty AND the notetypes table has rows.
@@ -222,6 +229,7 @@ def _get_models(conn: sqlite3.Connection) -> dict[str, ModelInfo]:
             field_names=[f["name"] for f in model["flds"]],
             templates=model.get("tmpls", []),
             model_type=model.get("type", 0),
+            plain_text=mid in _PLAIN_TEXT_MODEL_IDS,
         )
     _model_cache[conn_id] = result
     return result

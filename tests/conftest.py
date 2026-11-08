@@ -403,3 +403,27 @@ def mixed_apkg(tmp_path_factory: pytest.TempPathFactory) -> Path:
             (14, 402, 1, 0, -1),  # basic, suspended
         ],
     )
+
+
+@pytest.fixture(scope="session")
+def html_apkg(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Synthetic .apkg whose basic, basic+reversed, and cloze notes hold Anki HTML."""
+    tmp = tmp_path_factory.mktemp("apkg")
+    models: dict[str, Any] = {**BASIC_MODEL, **BASIC_REVERSED_MODEL, **CLOZE_MODEL}
+    return build_anki_apkg(
+        tmp,
+        "html",
+        models=models,
+        decks=DEFAULT_DECK,
+        notes=[
+            (500, "1000", "<b>bold</b> <br>x\x1f<div>back</div>", "guidH1", ""),
+            (501, "2000", "<b>bold</b> <br>x\x1f<i>italic</i>", "guidH2", ""),
+            (502, "3000", "{{c1::<b>bold</b>}} text\x1f<i>extra</i>", "guidH3", ""),
+        ],
+        cards=[
+            (20, 500, 1, 0, 0),  # basic
+            (21, 501, 1, 0, 0),  # basic+reversed forward
+            (22, 501, 1, 1, 0),  # basic+reversed reversed
+            (23, 502, 1, 0, 0),  # cloze c1
+        ],
+    )

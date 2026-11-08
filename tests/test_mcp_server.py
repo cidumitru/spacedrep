@@ -159,6 +159,12 @@ class TestGetCard:
         with pytest.raises(ToolError):
             get_card(999)
 
+    def test_plain_text_returned_verbatim(self, tmp_db: Path) -> None:
+        added = add_card("List<int> vs IEnumerable<T>", "Dictionary<string, List<int>> x;")
+        result = get_card(added["card_id"])
+        assert result["question"] == "List<int> vs IEnumerable<T>"
+        assert result["answer"] == "Dictionary<string, List<int>> x;"
+
 
 class TestUpdateCard:
     def test_update_question(self, card_id: int, tmp_db: Path) -> None:
