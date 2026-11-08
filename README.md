@@ -55,6 +55,11 @@ Add to Claude Desktop (`claude_desktop_config.json`):
 }
 ```
 
+Environment variables (MCP server and CLI):
+
+- `SPACEDREP_DB` — database path (default `./collection.anki21`)
+- `SPACEDREP_DESIRED_RETENTION` — FSRS target recall rate, `0.70`–`0.97` (default `0.9`), reported by `fsrs status` and `get_fsrs_status`. Invalid values are rejected at startup
+
 ### Agent loop
 
 `get_next_card` → grade → `submit_review`. The server bundles a few affordances for that loop:
@@ -62,6 +67,8 @@ Add to Claude Desktop (`claude_desktop_config.json`):
 - **Loop instructions on connect** — the agent gets the loop, the rating scale, and the rule that it picks the rating (not the user)
 - **Inline review history** — `get_next_card` and `get_card` include the last 3 reviews with their `user_answer` and `feedback` text
 - **Session pacing** — `get_next_card` returns `due_remaining` for "N cards left" messaging
+- **Reviews before new cards** — `get_next_card` (`card next`) serves learning cards, then due reviews (most overdue first), then new cards by position
+- **Due counts by state** — `get_due_count` (`stats due`) reports `new`, `learning`, and `review` separately, so a loop can hold back new cards while reviews are due
 - **Sibling auto-bury** — `submit_review` buries cloze/reversed siblings for 24h and returns them as `siblings_buried`, so the next card isn't a sibling whose answer was just shown
 
 ## CLI Quick Start
@@ -102,6 +109,10 @@ Filters work on `card list` and `card next`. See `--help` for the full list.
 spacedrep operates directly on Anki's native SQLite schema. Importing an `.apkg` replaces the working database; exporting writes it back. FSRS scheduling state survives the round-trip — cards reviewed in spacedrep show correct due dates when opened in Anki.
 
 Media files, JavaScript templates, and nested cloze deletions are not supported.
+
+### Plain text vs HTML
+
+Cards created with spacedrep (CLI or MCP) are plain text and returned verbatim — `List<int>`, fenced code blocks, and newlines survive. Cards imported from an Anki `.apkg` are HTML; their tags are stripped on read.
 
 ## Data Storage
 
