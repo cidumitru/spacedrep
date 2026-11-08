@@ -2,8 +2,10 @@
 
 import json
 import os
+import sqlite3
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 _PROJECT = str(Path(__file__).parents[1])
@@ -93,6 +95,27 @@ class TestCardCommands:
             assert result.returncode == 0
             data = json.loads(result.stdout)
             assert data["card_id"] is None
+
+    def test_next_review_card_before_new_cards(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            _init_db(db_path)
+            card_ids = [_add_card(db_path, f"Q{i}", f"A{i}") for i in range(4)]
+
+            # Collection created 10 days ago; Q3 becomes a review card due on day 7
+            # (3 days overdue) while Q0-Q2 stay new at positions 0-2.
+            conn = sqlite3.connect(str(db_path))
+            conn.execute("UPDATE col SET crt = ?", (int(time.time()) - 10 * 86400,))
+            conn.execute(
+                "UPDATE cards SET type = 2, queue = 2, due = 7, ivl = 3 WHERE id = ?",
+                (card_ids[3],),
+            )
+            conn.commit()
+            conn.close()
+
+            result = _run(["card", "next", "-q"], db_path)
+            assert result.returncode == 0
+            assert result.stdout.strip() == str(card_ids[3])
 
     def test_suspend_unsuspend(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -238,6 +261,20 @@ class TestCardGet:
             assert result.returncode == 3
             data = json.loads(result.stderr)
             assert data["error"] == "card_not_found"
+
+    def test_get_preserves_angle_brackets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            _init_db(db_path)
+            card_id = _add_card(
+                db_path, "List<int> vs IEnumerable<T>", "Dictionary<string, List<int>> x;"
+            )
+
+            result = _run(["card", "get", str(card_id)], db_path)
+            assert result.returncode == 0
+            data = json.loads(result.stdout)
+            assert data["question"] == "List<int> vs IEnumerable<T>"
+            assert data["answer"] == "Dictionary<string, List<int>> x;"
 
 
 class TestCardHistory:
@@ -545,6 +582,17 @@ class TestFsrs:
             assert data["is_default"] is True
             assert data["review_count"] == 0
             assert data["can_optimize"] is False
+
+    def test_fsrs_status_desired_retention_from_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            _init_db(db_path)
+
+            env = {"SPACEDREP_DB": str(db_path), "SPACEDREP_DESIRED_RETENTION": "0.85"}
+            result = _run_bare(["fsrs", "status"], env=env)
+            assert result.returncode == 0, result.stderr
+            data = json.loads(result.stdout)
+            assert data["desired_retention"] == 0.85
 
     def test_fsrs_optimize_no_data(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -7,9 +7,27 @@ or multiprocess execution, _scheduler must be protected with a lock or made
 per-request.
 """
 
+import os
+
 from fsrs import Card, Rating, ReviewLog, Scheduler, State
 
-_scheduler = Scheduler(desired_retention=0.9, enable_fuzzing=True)
+
+def _desired_retention_from_env() -> float:
+    """Read SPACEDREP_DESIRED_RETENTION: 0.9 when unset, else a number in [0.70, 0.97]."""
+    raw = os.environ.get("SPACEDREP_DESIRED_RETENTION")
+    if raw is None:
+        return 0.9
+    msg = f"SPACEDREP_DESIRED_RETENTION must be a number between 0.70 and 0.97, got {raw!r}"
+    try:
+        retention = float(raw)
+    except ValueError:
+        raise ValueError(msg) from None
+    if not 0.70 <= retention <= 0.97:  # also rejects nan and inf
+        raise ValueError(msg)
+    return retention
+
+
+_scheduler = Scheduler(desired_retention=_desired_retention_from_env(), enable_fuzzing=True)
 DEFAULT_PARAMS = tuple(_scheduler.parameters)
 
 
@@ -75,7 +93,14 @@ def preview_card(card: Card) -> list[tuple[int, Card, ReviewLog]]:
 def update_scheduler(params: list[float]) -> None:
     """Replace the module-level scheduler with new parameters."""
     global _scheduler
-    _scheduler = Scheduler(parameters=params, desired_retention=0.9, enable_fuzzing=True)
+    _scheduler = Scheduler(
+        parameters=params, desired_retention=_desired_retention_from_env(), enable_fuzzing=True
+    )
+
+
+def reload_from_env() -> None:
+    """Rebuild the scheduler with its current parameters, re-reading the environment."""
+    update_scheduler(list(_scheduler.parameters))
 
 
 def get_current_parameters() -> tuple[float, ...]:

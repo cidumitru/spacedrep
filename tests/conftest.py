@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from spacedrep import core, db
+from spacedrep import core, db, fsrs_engine
 from spacedrep.anki_schema import basic_guid
 
 
@@ -19,6 +19,7 @@ def _reset_fsrs_params() -> Generator[None, None, None]:  # pyright: ignore[repo
     """Reset FSRS parameters after each test to prevent state bleed."""
     yield
     core.reset_params_loaded()
+    fsrs_engine.reload_from_env()
 
 
 @pytest.fixture(autouse=True)
@@ -401,5 +402,29 @@ def mixed_apkg(tmp_path_factory: pytest.TempPathFactory) -> Path:
             (12, 401, 1, 0, 0),  # basic+reversed forward, Default deck
             (13, 401, 1, 1, 0),  # basic+reversed reversed, Default deck
             (14, 402, 1, 0, -1),  # basic, suspended
+        ],
+    )
+
+
+@pytest.fixture(scope="session")
+def html_apkg(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Synthetic .apkg whose basic, basic+reversed, and cloze notes hold Anki HTML."""
+    tmp = tmp_path_factory.mktemp("apkg")
+    models: dict[str, Any] = {**BASIC_MODEL, **BASIC_REVERSED_MODEL, **CLOZE_MODEL}
+    return build_anki_apkg(
+        tmp,
+        "html",
+        models=models,
+        decks=DEFAULT_DECK,
+        notes=[
+            (500, "1000", "<b>bold</b> <br>x\x1f<div>back</div>", "guidH1", ""),
+            (501, "2000", "<b>bold</b> <br>x\x1f<i>italic</i>", "guidH2", ""),
+            (502, "3000", "{{c1::<b>bold</b>}} text\x1f<i>extra</i>", "guidH3", ""),
+        ],
+        cards=[
+            (20, 500, 1, 0, 0),  # basic
+            (21, 501, 1, 0, 0),  # basic+reversed forward
+            (22, 501, 1, 1, 0),  # basic+reversed reversed
+            (23, 502, 1, 0, 0),  # cloze c1
         ],
     )

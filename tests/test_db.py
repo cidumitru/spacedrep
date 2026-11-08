@@ -1,6 +1,7 @@
 """Tests for db module (Anki-native schema)."""
 
 import sqlite3
+import time
 from pathlib import Path
 
 from spacedrep import db
@@ -166,6 +167,114 @@ def test_get_next_due_card_by_state(populated_db_multi_deck: Path) -> None:
     # No cards in "review" state yet
     due_review = db.get_next_due_card(conn, state="review")
     assert due_review is None
+    conn.close()
+
+
+# --- Ordering tests for get_next_due_card ---
+
+
+def _add_new_cards(conn: sqlite3.Connection, n: int) -> list[int]:
+    """Insert n new cards (queue positions 0..n-1) and return their IDs in order."""
+    ids: list[int] = []
+    for i in range(n):
+        card_id, _ = db.insert_card(
+            conn,
+            question=f"Q{i}",
+            answer=f"A{i}",
+            deck_name="Test",
+            guid=basic_guid(f"Q{i}", "Test"),
+        )
+        ids.append(card_id)
+    return ids
+
+
+def _backdate_collection(conn: sqlite3.Connection) -> None:
+    """Move col.crt 10 days back; a review card's due is a day number counted from it."""
+    conn.execute("UPDATE col SET crt = ?", (int(time.time()) - 10 * 86400,))
+
+
+def _make_review_card(conn: sqlite3.Connection, card_id: int, due_day: int) -> None:
+    """Turn a card into a review card due on day `due_day` (days since col.crt)."""
+    conn.execute(
+        "UPDATE cards SET type = 2, queue = 2, due = ?, ivl = 3 WHERE id = ?", (due_day, card_id)
+    )
+
+
+def test_get_next_due_card_review_before_new(tmp_db: Path) -> None:
+    """An overdue review card comes before new cards, whatever their positions."""
+    conn = db.get_connection(tmp_db)
+    ids = _add_new_cards(conn, 4)
+    _backdate_collection(conn)
+    _make_review_card(conn, ids[3], due_day=7)
+    conn.commit()
+
+    due = db.get_next_due_card(conn)
+    assert due is not None
+    assert due.card_id == ids[3]
+    assert due.state == "review"
+    assert due.due_remaining == 4
+    conn.close()
+
+
+def test_get_next_due_card_most_overdue_review_first(tmp_db: Path) -> None:
+    """Among due review cards the smallest due day (most overdue) comes first."""
+    conn = db.get_connection(tmp_db)
+    ids = _add_new_cards(conn, 2)
+    _backdate_collection(conn)
+    _make_review_card(conn, ids[0], due_day=7)
+    _make_review_card(conn, ids[1], due_day=5)
+    conn.commit()
+
+    due = db.get_next_due_card(conn)
+    assert due is not None
+    assert due.card_id == ids[1]
+    conn.close()
+
+
+def test_get_next_due_card_learning_before_review(tmp_db: Path) -> None:
+    """A due learning card still comes before an overdue review card."""
+    conn = db.get_connection(tmp_db)
+    ids = _add_new_cards(conn, 2)
+    _backdate_collection(conn)
+    _make_review_card(conn, ids[0], due_day=7)
+    conn.execute(
+        "UPDATE cards SET type = 1, queue = 1, due = ? WHERE id = ?",
+        (int(time.time()) - 60, ids[1]),
+    )
+    conn.commit()
+
+    due = db.get_next_due_card(conn)
+    assert due is not None
+    assert due.card_id == ids[1]
+    conn.close()
+
+
+def test_get_next_due_card_new_in_position_order(tmp_db: Path) -> None:
+    """With only new cards due, the lowest queue position comes first."""
+    conn = db.get_connection(tmp_db)
+    ids = _add_new_cards(conn, 3)
+    # Reverse the new queue so position order differs from insertion order.
+    conn.execute("UPDATE cards SET due = 2 - due")
+    conn.commit()
+
+    due = db.get_next_due_card(conn)
+    assert due is not None
+    assert due.card_id == ids[2]
+    conn.close()
+
+
+def test_get_next_due_card_state_filter_with_review_due(tmp_db: Path) -> None:
+    """state="new" still returns a new card while a review card is overdue."""
+    conn = db.get_connection(tmp_db)
+    ids = _add_new_cards(conn, 4)
+    _backdate_collection(conn)
+    _make_review_card(conn, ids[3], due_day=7)
+    conn.commit()
+
+    due = db.get_next_due_card(conn, state="new")
+    assert due is not None
+    assert due.card_id == ids[0]
+    assert due.state == "new"
     conn.close()
 
 

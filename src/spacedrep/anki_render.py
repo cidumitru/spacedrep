@@ -4,6 +4,7 @@ Extracted from apkg_reader.py. All rendering is pure: no I/O, no DB access.
 """
 
 import re
+from collections.abc import Callable
 
 from bs4 import BeautifulSoup
 
@@ -19,21 +20,31 @@ _ANKI_SPECIAL_FIELDS = frozenset(
     {"FrontSide", "Tags", "Type", "Deck", "Subdeck", "Card", "CardFlag"}
 )
 
+# Turns a raw field value into display text (strip_html or _verbatim).
+Cleaner = Callable[[str], str]
+
 
 class ModelInfo:
-    """Parsed Anki model (note type) metadata."""
+    """Parsed Anki model (note type) metadata.
 
-    __slots__ = ("field_names", "templates", "model_type")
+    plain_text marks spacedrep's own note types: their fields hold plain text
+    and render verbatim. Other note types come from Anki, whose fields are HTML.
+    """
+
+    __slots__ = ("field_names", "templates", "model_type", "plain_text")
 
     def __init__(
         self,
         field_names: list[str],
         templates: list[dict[str, str]],
         model_type: int,
+        *,
+        plain_text: bool = False,
     ) -> None:
         self.field_names = field_names
         self.templates = templates
         self.model_type = model_type
+        self.plain_text = plain_text
 
 
 class NoteInfo:
@@ -61,33 +72,37 @@ def render_card(
         card_ord: 0-based card ordinal.
 
     Returns:
-        (question, answer, extra_fields) with HTML stripped.
+        (question, answer, extra_fields): verbatim for plain-text models,
+        with HTML stripped otherwise.
     """
     fields = note_flds.split("\x1f")
     field_names = model_info.field_names
+    cleaner = _verbatim if model_info.plain_text else strip_html
 
     if model_info.model_type == 1:
         # Cloze model
         cloze_field_idx = _find_cloze_field(model_info, fields)
         raw_text = fields[cloze_field_idx] if cloze_field_idx < len(fields) else ""
         question_raw, answer_raw = render_cloze(raw_text, card_ord)
-        question = strip_html(question_raw)
-        answer = strip_html(answer_raw)
+        question = cleaner(question_raw)
+        answer = cleaner(answer_raw)
         extra: dict[str, str] = {}
         for i, fname in enumerate(field_names):
             if i != cloze_field_idx and i < len(fields):
-                stripped = strip_html(fields[i])
+                stripped = cleaner(fields[i])
                 if stripped:
                     extra[fname] = stripped
         return (question, answer, extra)
 
     if len(model_info.templates) > 1:
         # Multi-template basic model (e.g., basic+reversed)
-        return resolve_template_fields(model_info.templates, card_ord, fields, field_names)
+        return resolve_template_fields(
+            model_info.templates, card_ord, fields, field_names, cleaner=cleaner
+        )
 
     # Single-template basic model — use field name detection
     qi, ai = detect_field_mapping(field_names, None, None)
-    return _build_qa_extra(fields, field_names, qi, ai)
+    return _build_qa_extra(fields, field_names, qi, ai, cleaner=cleaner)
 
 
 def render_cloze(text: str, card_ord: int) -> tuple[str, str]:
@@ -183,6 +198,19 @@ def resolve_card_qa_fields(model_info: "ModelInfo", card_ord: int) -> tuple[int 
     return detect_field_mapping(model_info.field_names, None, None)
 
 
+def strip_html(html: str) -> str:
+    """Strip HTML tags, returning plain text."""
+    if not html or "<" not in html:
+        return html.strip()
+    soup = BeautifulSoup(html, "html.parser")
+    return soup.get_text(separator=" ", strip=True)
+
+
+def _verbatim(text: str) -> str:
+    """Return plain text as-is, trimming only surrounding whitespace."""
+    return text.strip()
+
+
 def resolve_template_fields(
     templates: list[dict[str, str]],
     card_ord: int,
@@ -190,6 +218,8 @@ def resolve_template_fields(
     field_names: list[str],
     question_field: str | None = None,
     answer_field: str | None = None,
+    *,
+    cleaner: Cleaner = strip_html,
 ) -> tuple[str, str, dict[str, str]]:
     """Resolve Q/A from a model template at a given ordinal.
 
@@ -200,14 +230,15 @@ def resolve_template_fields(
         field_names: Field names from the model.
         question_field: Explicit question field override (ignored, uses template).
         answer_field: Explicit answer field override (ignored, uses template).
+        cleaner: Turns each raw field into display text (default strips HTML).
 
     Returns:
-        (question, answer, extra_fields) tuple with HTML stripped.
+        (question, answer, extra_fields) tuple, each passed through cleaner.
     """
     if card_ord >= len(templates):
         # Fallback: shouldn't happen, but be safe
         qi, ai = detect_field_mapping(field_names, question_field, answer_field)
-        return _build_qa_extra(fields, field_names, qi, ai)
+        return _build_qa_extra(fields, field_names, qi, ai, cleaner=cleaner)
 
     tmpl = templates[card_ord]
     field_map = {name: i for i, name in enumerate(field_names)}
@@ -217,17 +248,9 @@ def resolve_template_fields(
 
     if q_idx is None or a_idx is None:
         qi, ai = detect_field_mapping(field_names, question_field, answer_field)
-        return _build_qa_extra(fields, field_names, qi, ai)
+        return _build_qa_extra(fields, field_names, qi, ai, cleaner=cleaner)
 
-    return _build_qa_extra(fields, field_names, q_idx, a_idx)
-
-
-def strip_html(html: str) -> str:
-    """Strip HTML tags, returning plain text."""
-    if not html or "<" not in html:
-        return html.strip()
-    soup = BeautifulSoup(html, "html.parser")
-    return soup.get_text(separator=" ", strip=True)
+    return _build_qa_extra(fields, field_names, q_idx, a_idx, cleaner=cleaner)
 
 
 def _find_cloze_field(minfo: ModelInfo, fields: list[str]) -> int:
@@ -264,15 +287,15 @@ def _first_real_field(template_text: str, field_map: dict[str, int]) -> int | No
 
 
 def _build_qa_extra(
-    fields: list[str], field_names: list[str], qi: int, ai: int
+    fields: list[str], field_names: list[str], qi: int, ai: int, *, cleaner: Cleaner = strip_html
 ) -> tuple[str, str, dict[str, str]]:
     """Build (question, answer, extra_fields) from field indices."""
-    question = strip_html(fields[qi]) if qi < len(fields) else ""
-    answer = strip_html(fields[ai]) if ai < len(fields) else ""
+    question = cleaner(fields[qi]) if qi < len(fields) else ""
+    answer = cleaner(fields[ai]) if ai < len(fields) else ""
     extra: dict[str, str] = {}
     for i, fname in enumerate(field_names):
         if i != qi and i != ai and i < len(fields):
-            stripped = strip_html(fields[i])
+            stripped = cleaner(fields[i])
             if stripped:
                 extra[fname] = stripped
     return (question, answer, extra)
