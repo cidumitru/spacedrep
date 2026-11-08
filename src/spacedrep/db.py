@@ -623,8 +623,9 @@ def get_next_due_card(
             OR (c.type = 2 AND c.due <= ?)
         )
         {filter_sql}
+        -- c.due is a timestamp, day number or position by type; never compare it across types
         ORDER BY
-            CASE WHEN c.type IN (1, 3) THEN 0 ELSE 1 END,
+            CASE WHEN c.type IN (1, 3) THEN 0 WHEN c.type = 2 THEN 1 ELSE 2 END,
             c.due ASC
         LIMIT 1
     """
