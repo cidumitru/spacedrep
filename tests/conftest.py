@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from spacedrep import core, db
+from spacedrep import core, db, fsrs_engine
 from spacedrep.anki_schema import basic_guid
 
 
@@ -19,6 +19,7 @@ def _reset_fsrs_params() -> Generator[None, None, None]:  # pyright: ignore[repo
     """Reset FSRS parameters after each test to prevent state bleed."""
     yield
     core.reset_params_loaded()
+    fsrs_engine.reload_from_env()
 
 
 @pytest.fixture(autouse=True)

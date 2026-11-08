@@ -225,6 +225,7 @@ class FsrsStatus(BaseModel):
 
     parameters: list[float]
     is_default: bool
+    desired_retention: float
     review_count: int
     min_reviews_needed: int
     can_optimize: bool

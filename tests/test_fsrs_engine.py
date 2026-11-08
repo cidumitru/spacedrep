@@ -1,5 +1,6 @@
 """Tests for fsrs_engine module."""
 
+import pytest
 from fsrs import State
 
 from spacedrep import fsrs_engine
@@ -124,3 +125,54 @@ def test_get_scheduler() -> None:
     scheduler = fsrs_engine.get_scheduler()
     assert scheduler is not None
     assert scheduler.parameters == fsrs_engine.get_current_parameters()
+
+
+# --- Desired retention tests ---
+
+
+def test_desired_retention_defaults_to_0_9(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SPACEDREP_DESIRED_RETENTION", raising=False)
+    fsrs_engine.reload_from_env()
+    assert fsrs_engine.get_scheduler().desired_retention == 0.9
+
+
+def test_desired_retention_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SPACEDREP_DESIRED_RETENTION", "0.85")
+    fsrs_engine.reload_from_env()
+    assert fsrs_engine.get_scheduler().desired_retention == 0.85
+
+    # Rebuilding with optimised parameters keeps the configured retention
+    new_params = list(fsrs_engine.DEFAULT_PARAMS)
+    new_params[0] = 0.5555
+    fsrs_engine.update_scheduler(new_params)
+    assert fsrs_engine.get_scheduler().desired_retention == 0.85
+
+
+@pytest.mark.parametrize("value", ["0.70", "0.97"])
+def test_desired_retention_bounds_accepted(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    monkeypatch.setenv("SPACEDREP_DESIRED_RETENTION", value)
+    fsrs_engine.reload_from_env()
+    assert fsrs_engine.get_scheduler().desired_retention == float(value)
+
+
+@pytest.mark.parametrize("value", ["0.5", "1.2", "abc", "nan", "inf"])
+def test_desired_retention_rejects_invalid(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    monkeypatch.setenv("SPACEDREP_DESIRED_RETENTION", value)
+    with pytest.raises(ValueError) as excinfo:
+        fsrs_engine.reload_from_env()
+    assert str(excinfo.value) == (
+        f"SPACEDREP_DESIRED_RETENTION must be a number between 0.70 and 0.97, got '{value}'"
+    )
+
+
+def test_preview_good_interval_grows_as_retention_drops(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A new card's "good" is a fixed learning step at any retention, so review it once:
+    # the next "good" graduates it to review, where retention sets the interval.
+    card, _ = fsrs_engine.review_card(fsrs_engine.create_new_card(), 3)
+    interval_days: list[int] = []
+    for retention in ("0.9", "0.85"):
+        monkeypatch.setenv("SPACEDREP_DESIRED_RETENTION", retention)
+        fsrs_engine.reload_from_env()
+        _, good, log = fsrs_engine.preview_card(card)[2]  # (3, card, log) for "good"
+        interval_days.append((good.due - log.review_datetime).days)
+    assert interval_days[1] > interval_days[0]

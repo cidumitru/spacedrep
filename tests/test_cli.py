@@ -560,6 +560,17 @@ class TestFsrs:
             assert data["review_count"] == 0
             assert data["can_optimize"] is False
 
+    def test_fsrs_status_desired_retention_from_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            _init_db(db_path)
+
+            env = {"SPACEDREP_DB": str(db_path), "SPACEDREP_DESIRED_RETENTION": "0.85"}
+            result = _run_bare(["fsrs", "status"], env=env)
+            assert result.returncode == 0, result.stderr
+            data = json.loads(result.stdout)
+            assert data["desired_retention"] == 0.85
+
     def test_fsrs_optimize_no_data(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "test.db"

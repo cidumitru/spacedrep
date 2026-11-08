@@ -1370,6 +1370,7 @@ def get_fsrs_status(db_path: Path) -> FsrsStatus:
         return FsrsStatus(
             parameters=list(fsrs_engine.get_current_parameters()),
             is_default=fsrs_engine.is_default_parameters(),
+            desired_retention=fsrs_engine.get_scheduler().desired_retention,
             review_count=review_count,
             min_reviews_needed=512,
             can_optimize=review_count >= 512,
