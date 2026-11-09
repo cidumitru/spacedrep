@@ -131,11 +131,20 @@ class BulkCardInput(BaseModel):
     deck: str = "Default"
     tags: str = ""
     type: Literal["basic", "cloze", "reversed"] = "basic"
+    # Extra note fields for basic/reversed cards, {name: value}. Stored after
+    # Question/Answer; returned under extra_fields on read.
+    extra_fields: dict[str, str] = {}
 
     @model_validator(mode="after")
     def _validate_fields(self) -> "BulkCardInput":
         if not self.question.strip():
             msg = "Question cannot be empty or whitespace-only"
+            raise ValueError(msg)
+        if self.type == "cloze" and self.extra_fields:
+            msg = (
+                "extra_fields is not supported for cloze cards; "
+                "use type 'basic' or 'reversed', or drop extra_fields"
+            )
             raise ValueError(msg)
         if self.type in ("basic", "reversed") and not self.answer.strip():
             msg = f"{self.type.capitalize()} cards require a non-empty answer"

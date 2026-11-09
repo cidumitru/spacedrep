@@ -3,10 +3,12 @@
 Extracted from apkg_reader.py. All rendering is pure: no I/O, no DB access.
 """
 
+import html as _html
 import re
 from collections.abc import Callable
 
 from bs4 import BeautifulSoup
+from bs4.element import NavigableString, PageElement, Tag
 
 QUESTION_FIELD_NAMES = {"front", "question", "prompt", "q"}
 ANSWER_FIELD_NAMES = {"back", "answer", "implementation", "a", "response"}
@@ -16,9 +18,10 @@ _CLOZE_FIELD_RE = re.compile(r"\{\{cloze:([^}]+)\}\}")
 # Matches {{FieldName}}, {{type:FieldName}}, {{hint:FieldName}}, {{#FieldName}}, {{/FieldName}}
 _TEMPLATE_FIELD_RE = re.compile(r"\{\{(?:#|/|type:|hint:)?([^}:]+)\}\}")
 
-_ANKI_SPECIAL_FIELDS = frozenset(
+ANKI_SPECIAL_FIELDS = frozenset(
     {"FrontSide", "Tags", "Type", "Deck", "Subdeck", "Card", "CardFlag"}
 )
+_ANKI_SPECIAL_FIELDS = ANKI_SPECIAL_FIELDS
 
 # Turns a raw field value into display text (strip_html or _verbatim).
 Cleaner = Callable[[str], str]
@@ -199,11 +202,153 @@ def resolve_card_qa_fields(model_info: "ModelInfo", card_ord: int) -> tuple[int 
 
 
 def strip_html(html: str) -> str:
-    """Strip HTML tags, returning plain text."""
-    if not html or "<" not in html:
-        return html.strip()
+    """Render Anki HTML as plain text, keeping its visible structure.
+
+    Line breaks (<br>) and block ends (<p>, <div>, <li>, <tr>, <h1>-<h6>,
+    <blockquote>) become newlines; list items get a "- " prefix indented two
+    spaces per nesting level; inline <code>/<tt> become `text`; <pre> becomes
+    a fenced block. Entities are unescaped. Runs of more than two newlines
+    collapse to two, trailing spaces are stripped from each line, and the
+    whole result is stripped.
+    """
+    if not html:
+        return ""
+    if "<" not in html:
+        return _tidy(_html.unescape(html) if "&" in html else html)
     soup = BeautifulSoup(html, "html.parser")
-    return soup.get_text(separator=" ", strip=True)
+    out = _TextBuilder()
+    _render_children(soup, out, list_depth=0)
+    return _tidy(out.getvalue())
+
+
+_BLOCK_TAGS = frozenset(
+    {"p", "div", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "hr", "table"}
+)
+_LIST_TAGS = frozenset({"ul", "ol"})
+_INLINE_CODE_TAGS = frozenset({"code", "tt"})
+_SKIP_TAGS = frozenset({"script", "style", "head", "title"})
+_HTML_SPACE_RE = re.compile(r"[ \t\n\r\f\xa0]+")
+_EXCESS_NEWLINES_RE = re.compile(r"\n{3,}")
+_CODE_LANG_RE = re.compile(r"(?:^|\s)(?:language|lang)-([\w+#.-]+)")
+
+
+class _TextBuilder:
+    """Accumulates rendered text and tracks whether we sit at a line start."""
+
+    __slots__ = ("_parts",)
+
+    def __init__(self) -> None:
+        self._parts: list[str] = []
+
+    def _last_char(self) -> str:
+        for part in reversed(self._parts):
+            if part:
+                return part[-1]
+        return ""
+
+    def at_line_start(self) -> bool:
+        return self._last_char() in ("", "\n")
+
+    def text(self, s: str) -> None:
+        """Append HTML text: whitespace collapses to single spaces."""
+        s = _HTML_SPACE_RE.sub(" ", s)
+        if s.startswith(" ") and (self.at_line_start() or self._last_char() == " "):
+            s = s[1:]
+        if s:
+            self._parts.append(s)
+
+    def raw(self, s: str) -> None:
+        """Append text verbatim (list prefixes, fenced code)."""
+        if s:
+            self._parts.append(s)
+
+    def newline(self) -> None:
+        """Hard line break; drops trailing spaces on the current line."""
+        if self._parts:
+            self._parts[-1] = self._parts[-1].rstrip(" \t")
+        self._parts.append("\n")
+
+    def ensure_newline(self) -> None:
+        """Line break unless already at the start of a line."""
+        if not self.at_line_start():
+            self.newline()
+
+    def getvalue(self) -> str:
+        return "".join(self._parts)
+
+
+def _render_children(node: Tag, out: _TextBuilder, *, list_depth: int) -> None:
+    for child in node.children:
+        _render_node(child, out, list_depth=list_depth)
+
+
+def _render_node(node: PageElement, out: _TextBuilder, *, list_depth: int) -> None:
+    if isinstance(node, NavigableString):
+        # Comments, CDATA, doctypes and processing instructions are not text.
+        if type(node) is NavigableString:
+            out.text(str(node))
+        return
+    if not isinstance(node, Tag):
+        return
+    name = node.name.lower()
+    if name in _SKIP_TAGS:
+        return
+    if name == "br":
+        out.newline()
+        # html.parser nests text inside <br> when <br> and <br/> are mixed.
+        _render_children(node, out, list_depth=list_depth)
+    elif name == "pre":
+        _render_pre(node, out)
+    elif name in _INLINE_CODE_TAGS:
+        inner = _HTML_SPACE_RE.sub(" ", node.get_text()).strip()
+        if inner:
+            fence = "``" if "`" in inner else "`"
+            pad = " " if fence == "``" else ""
+            out.text(f"{fence}{pad}{inner}{pad}{fence}")
+    elif name == "li":
+        out.ensure_newline()
+        out.raw("  " * max(list_depth - 1, 0) + "- ")
+        _render_children(node, out, list_depth=list_depth)
+        out.ensure_newline()
+    elif name in _LIST_TAGS:
+        out.ensure_newline()
+        _render_children(node, out, list_depth=list_depth + 1)
+        out.ensure_newline()
+    elif name in ("td", "th"):
+        prev = node.find_previous_sibling(["td", "th"])
+        if prev is not None:
+            out.text(" | ")
+        _render_children(node, out, list_depth=list_depth)
+    elif name in _BLOCK_TAGS:
+        out.ensure_newline()
+        _render_children(node, out, list_depth=list_depth)
+        out.ensure_newline()
+    else:
+        _render_children(node, out, list_depth=list_depth)
+
+
+def _render_pre(node: Tag, out: _TextBuilder) -> None:
+    """Render <pre> as a fenced code block on its own lines."""
+    for br in node.find_all("br"):
+        br.insert_before("\n")
+        br.unwrap()  # keep any text html.parser nested inside the <br>
+    lang = ""
+    for candidate in (node, node.find("code")):
+        if isinstance(candidate, Tag):
+            m = _CODE_LANG_RE.search(" ".join(candidate.get_attribute_list("class") or []))
+            if m:
+                lang = m.group(1)
+                break
+    body = node.get_text().replace("\xa0", " ").strip("\n").rstrip()
+    out.ensure_newline()
+    out.raw(f"```{lang}\n{body}\n```")
+    out.newline()
+
+
+def _tidy(text: str) -> str:
+    """Strip trailing spaces per line, cap blank runs at one blank line, strip ends."""
+    lines = [line.rstrip() for line in text.split("\n")]
+    return _EXCESS_NEWLINES_RE.sub("\n\n", "\n".join(lines)).strip()
 
 
 def _verbatim(text: str) -> str:
@@ -251,6 +396,11 @@ def resolve_template_fields(
         return _build_qa_extra(fields, field_names, qi, ai, cleaner=cleaner)
 
     return _build_qa_extra(fields, field_names, q_idx, a_idx, cleaner=cleaner)
+
+
+def find_cloze_field(minfo: ModelInfo, fields: list[str]) -> int:
+    """Index of the field holding a cloze note's {{c1::...}} text."""
+    return _find_cloze_field(minfo, fields)
 
 
 def _find_cloze_field(minfo: ModelInfo, fields: list[str]) -> int:

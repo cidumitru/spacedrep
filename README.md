@@ -33,6 +33,7 @@ Optional extras: `spacedrep[mcp]` for the MCP server, `spacedrep[optimizer]` for
 - **FSRS scheduling** — same algorithm as Anki 23.10+, with parameter optimization from your review history
 - **Cloze deletions** — `{{c1::answer}}` syntax, auto-expands into multiple cards
 - **Reversed cards** — one note becomes two cards (Q→A and A→Q); edits are template-aware and re-adds dedupe on (question, deck). Basic ↔ reversed collisions are caught with a clear error — delete the existing card first to convert it
+- **Extra fields** — attach examples, sources or mnemonics with `--field NAME=VALUE`; they come back under `extra_fields` and show on the answer side in Anki
 - **Anki-native storage** — single SQLite file using Anki's schema for full round-trip compatibility
 - **Rich filtering** — by deck, tags, state, date ranges, FSRS properties, and more
 - **Agent-friendly** — duplicate detection, leech detection, review preview, bury/unbury, review history
@@ -85,6 +86,25 @@ spacedrep review submit <card_id> good       # again | hard | good | easy
 
 See `spacedrep --help` and `spacedrep <command> --help` for all options.
 
+## Extra Fields
+
+Cards can carry extra note fields beyond question and answer. They are returned under `extra_fields` by `card get` and `card next`.
+
+```bash
+spacedrep card add "What does map do?" "Applies f to each element" \
+  --field Example="(map inc [1 2 3])" --field Source="SICP 2.2"
+spacedrep card update 42 --field Source="SICP 2.2.1" --field Example=   # change one, clear one
+echo '[{"question":"chat","answer":"cat","type":"reversed","extra_fields":{"Gender":"m"}}]' \
+  | spacedrep card add-bulk
+```
+
+- `--field` repeats and splits on the first `=`. An empty value is allowed, and on `card update` it clears the field.
+- On cards created by spacedrep, a new NAME is added to the note type and shown on the answer side when exported to Anki. Existing fields keep their order.
+- On imported Anki note types, NAME must match one of the note type's fields exactly. An unknown name fails with `invalid_field` and the error lists the available fields.
+- Fields that render as the card's question or answer are set with `--question` / `--answer`, not `--field`.
+- Names cannot be empty or contain whitespace, `{`, `}`, `:` or `"`. `extra_fields` is not supported on cloze items in `card add-bulk`.
+- MCP: `add_card`, `add_reversed_card` and `update_card` take `extra_fields_json`, a JSON object passed as a string, e.g. `{"Source": "SICP"}`. Items passed to `add_cards_bulk` take `extra_fields`.
+
 ## Cloze Deletions
 
 Each `{{c1::answer}}` becomes a separate card. Hints are supported: `{{c1::Ottawa::capital city}}` shows `[capital city]` as the blank.
@@ -106,13 +126,20 @@ Filters work on `card list` and `card next`. See `--help` for the full list.
 
 ## Anki Compatibility
 
-spacedrep operates directly on Anki's native SQLite schema. Importing an `.apkg` replaces the working database; exporting writes it back. FSRS scheduling state survives the round-trip — cards reviewed in spacedrep show correct due dates when opened in Anki.
+spacedrep operates directly on Anki's native SQLite schema. Importing an `.apkg` (or `.colpkg`) replaces the working database; exporting writes it back. FSRS scheduling state survives the round-trip — cards reviewed in spacedrep show correct due dates when opened in Anki.
+
+Anki Desktop's default export uses a newer package format (`collection.anki21b`) that spacedrep cannot read. Importing one fails with `import_error` and leaves your database untouched. In Anki, choose File → Export and tick **Support older Anki versions**.
 
 Media files, JavaScript templates, and nested cloze deletions are not supported.
 
 ### Plain text vs HTML
 
-Cards created with spacedrep (CLI or MCP) are plain text and returned verbatim — `List<int>`, fenced code blocks, and newlines survive. Cards imported from an Anki `.apkg` are HTML; their tags are stripped on read.
+Cards created with spacedrep (CLI or MCP) are plain text and returned verbatim — `List<int>`, fenced code blocks, and newlines survive. Cards imported from an Anki `.apkg` are HTML. On read they are rendered as plain text that keeps the structure:
+
+- `<br>`, paragraphs, divs and headings become line breaks.
+- List items become `- ` bullets, nested lists are indented.
+- Inline `<code>` becomes `` `code` ``, and `<pre>` becomes a fenced block.
+- Entities such as `&lt;int&gt;` are decoded.
 
 ## Data Storage
 

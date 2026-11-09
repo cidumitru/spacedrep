@@ -112,20 +112,102 @@ class NoFieldsProvidedError(SpacedrepError):
     def __init__(self) -> None:
         super().__init__(
             error_code="no_fields",
-            message="Provide at least one field to update: question, answer, tags, or deck",
-            suggestion="Set at least one of: question, answer, tags, deck",
+            message=(
+                "Provide at least one field to update: question, answer, tags, deck, or field"
+            ),
+            suggestion="Set at least one of: question, answer, tags, deck, field (NAME=VALUE)",
             exit_code=2,
         )
 
 
+class InvalidFieldError(SpacedrepError):
+    """An extra field (--field NAME=VALUE / extra_fields) that cannot be applied."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        field: str | None = None,
+        suggestion: str = "",
+        available: list[str] | None = None,
+        batch_index: int | None = None,
+    ) -> None:
+        extras: dict[str, str | int | None] = {"field": field}
+        if available is not None:
+            extras["available_fields"] = ", ".join(available)
+        if batch_index is not None:
+            message = f"[batch item {batch_index}] {message}"
+            extras["batch_index"] = batch_index
+        super().__init__(
+            error_code="invalid_field",
+            message=message,
+            suggestion=suggestion or "Pass extra fields as NAME=VALUE",
+            exit_code=2,
+            **extras,
+        )
+
+    @classmethod
+    def from_db(cls, e: db.NoteFieldError, batch_index: int | None = None) -> "InvalidFieldError":
+        return cls(
+            e.message,
+            field=e.field,
+            suggestion=e.suggestion,
+            available=e.available,
+            batch_index=batch_index,
+        )
+
+
+def parse_field_options(options: list[str] | None) -> dict[str, str]:
+    """Parse repeatable NAME=VALUE options (split on the first "=").
+
+    An empty VALUE is kept (it clears the field on update). Raises
+    InvalidFieldError for a missing "=" or a NAME given twice.
+    """
+    result: dict[str, str] = {}
+    for opt in options or []:
+        name, sep, value = opt.partition("=")
+        if not sep:
+            raise InvalidFieldError(
+                f"Invalid --field {opt!r}: expected NAME=VALUE",
+                field=opt,
+                suggestion='Use --field NAME=VALUE, e.g. --field Source="SICP 1.2"',
+            )
+        if name in result:
+            raise InvalidFieldError(
+                f"--field {name!r} given more than once",
+                field=name,
+                suggestion="Pass each field name once",
+            )
+        result[name] = value
+    return result
+
+
 class ApkgImportError(SpacedrepError):
-    def __init__(self, message: str) -> None:
+    def __init__(self, message: str, suggestion: str = "") -> None:
         super().__init__(
             error_code="import_error",
             message=message,
-            suggestion="Check the file path and format (.apkg)",
+            suggestion=suggestion or "Check the file path and format (.apkg or .colpkg)",
             exit_code=1,
         )
+
+
+_MODERN_PACKAGE_MESSAGE = (
+    "This package is in the modern format; re-export from Anki Desktop with "
+    '"Support older Anki versions" checked.'
+)
+_MODERN_PACKAGE_SUGGESTION = (
+    'In Anki Desktop: File \u2192 Export, tick "Support older Anki versions", '
+    "then import the new file."
+)
+
+
+class ModernPackageError(ApkgImportError):
+    """An .apkg/.colpkg whose real collection is collection.anki21b (zstd,
+    split-table schema). Its collection.anki2 is a one-note placeholder."""
+
+    def __init__(self) -> None:
+        super().__init__(_MODERN_PACKAGE_MESSAGE, suggestion=_MODERN_PACKAGE_SUGGESTION)
 
 
 class BulkInputError(SpacedrepError):
@@ -133,7 +215,10 @@ class BulkInputError(SpacedrepError):
         super().__init__(
             error_code="bulk_input_error",
             message=message,
-            suggestion="Input must be a JSON array of {question, answer, deck?, tags?}",
+            suggestion=(
+                "Input must be a JSON array of"
+                " {question, answer, deck?, tags?, type?, extra_fields?}"
+            ),
             exit_code=2,
         )
 
@@ -512,8 +597,13 @@ def add_card(
     deck: str = "Default",
     tags: str = "",
     source: CardSource = "manual",
+    extra_fields: dict[str, str] | None = None,
 ) -> dict[str, int | str | bool]:
     """Add a new card. Re-adding the same question to the same deck updates the existing card.
+
+    extra_fields are stored as additional note fields (the model grows on
+    demand) and come back under extra_fields on read. A re-add keeps extras
+    already on the note unless it sets them again.
 
     Dedup matches the question value used at note *creation* — after
     update_card rewrites the Question field, re-adding with the new text
@@ -537,15 +627,19 @@ def add_card(
             new_model="basic",
         )
         guid = basic_guid(question, deck)
-        card_id, was_update = db.insert_card(
-            conn,
-            question=question,
-            answer=answer,
-            deck_name=deck,
-            tags=tags,
-            source=source,
-            guid=guid,
-        )
+        try:
+            card_id, was_update = db.insert_card(
+                conn,
+                question=question,
+                answer=answer,
+                deck_name=deck,
+                tags=tags,
+                source=source,
+                guid=guid,
+                extra_fields=extra_fields,
+            )
+        except db.NoteFieldError as e:
+            raise InvalidFieldError.from_db(e) from e
         conn.commit()
         return {"card_id": card_id, "deck": deck, "was_update": was_update}
 
@@ -561,58 +655,68 @@ def add_cards_bulk(db_path: Path, cards: list[BulkCardInput]) -> BulkAddResult:
     with _open_db(db_path) as conn:
         created: list[int] = []
         for i, card_input in enumerate(cards):
-            if card_input.type == "cloze":
-                guid = cloze_guid(card_input.question)
-                card_ids = _expand_cloze(
-                    conn, card_input.question, card_input.deck, card_input.tags, guid
-                )
-                created.extend(card_ids)
-            elif card_input.type == "reversed":
-                _raise_if_cross_model_conflict(
-                    conn,
-                    question=card_input.question,
-                    deck=card_input.deck,
-                    this_model_id=BASIC_REVERSED_MODEL_ID,
-                    new_model="reversed",
-                    batch_index=i,
-                )
-                rev_guid = reversed_guid(card_input.question, card_input.deck)
-                _, rev_card_ids, _ = db.insert_reversed_note(
-                    conn,
-                    question=card_input.question,
-                    answer=card_input.answer,
-                    deck_name=card_input.deck,
-                    tags=card_input.tags,
-                    source="manual",
-                    guid=rev_guid,
-                )
-                created.extend(rev_card_ids)
-            else:
-                _raise_if_cross_model_conflict(
-                    conn,
-                    question=card_input.question,
-                    deck=card_input.deck,
-                    this_model_id=BASIC_MODEL_ID,
-                    new_model="basic",
-                    batch_index=i,
-                )
-                guid = basic_guid(card_input.question, card_input.deck)
-                card_id, _ = db.insert_card(
-                    conn,
-                    question=card_input.question,
-                    answer=card_input.answer,
-                    deck_name=card_input.deck,
-                    tags=card_input.tags,
-                    source="manual",
-                    guid=guid,
-                )
-                created.append(card_id)
+            try:
+                created.extend(_add_bulk_item(conn, i, card_input))
+            except db.NoteFieldError as e:
+                raise InvalidFieldError.from_db(e, batch_index=i) from e
         conn.commit()
         # Preserve order, drop duplicate ids from re-adds (dedup hits).
         # Semantics: `created` is the set of card IDs that exist as a
         # result of this call; `total` is the size of that set.
         deduped: list[int] = list(dict.fromkeys(created))
         return BulkAddResult(created=deduped, total=len(deduped))
+
+
+def _add_bulk_item(conn: sqlite3.Connection, i: int, card_input: BulkCardInput) -> list[int]:
+    """Insert one add_cards_bulk item; returns the card ids it produced."""
+    created: list[int] = []
+    if card_input.type == "cloze":
+        guid = cloze_guid(card_input.question)
+        card_ids = _expand_cloze(conn, card_input.question, card_input.deck, card_input.tags, guid)
+        created.extend(card_ids)
+    elif card_input.type == "reversed":
+        _raise_if_cross_model_conflict(
+            conn,
+            question=card_input.question,
+            deck=card_input.deck,
+            this_model_id=BASIC_REVERSED_MODEL_ID,
+            new_model="reversed",
+            batch_index=i,
+        )
+        rev_guid = reversed_guid(card_input.question, card_input.deck)
+        _, rev_card_ids, _ = db.insert_reversed_note(
+            conn,
+            question=card_input.question,
+            answer=card_input.answer,
+            deck_name=card_input.deck,
+            tags=card_input.tags,
+            source="manual",
+            guid=rev_guid,
+            extra_fields=card_input.extra_fields,
+        )
+        created.extend(rev_card_ids)
+    else:
+        _raise_if_cross_model_conflict(
+            conn,
+            question=card_input.question,
+            deck=card_input.deck,
+            this_model_id=BASIC_MODEL_ID,
+            new_model="basic",
+            batch_index=i,
+        )
+        guid = basic_guid(card_input.question, card_input.deck)
+        card_id, _ = db.insert_card(
+            conn,
+            question=card_input.question,
+            answer=card_input.answer,
+            deck_name=card_input.deck,
+            tags=card_input.tags,
+            source="manual",
+            guid=guid,
+            extra_fields=card_input.extra_fields,
+        )
+        created.append(card_id)
+    return created
 
 
 def add_reversed_card(
@@ -622,6 +726,7 @@ def add_reversed_card(
     deck: str = "Default",
     tags: str = "",
     source: CardSource = "manual",
+    extra_fields: dict[str, str] | None = None,
 ) -> ReversedAddResult:
     """Add a reversed card pair: one note, two cards (Q→A and A→Q).
 
@@ -649,15 +754,19 @@ def add_reversed_card(
             new_model="reversed",
         )
         guid = reversed_guid(question, deck)
-        note_id, card_ids, _ = db.insert_reversed_note(
-            conn,
-            question=question,
-            answer=answer,
-            deck_name=deck,
-            tags=tags,
-            source=source,
-            guid=guid,
-        )
+        try:
+            note_id, card_ids, _ = db.insert_reversed_note(
+                conn,
+                question=question,
+                answer=answer,
+                deck_name=deck,
+                tags=tags,
+                source=source,
+                guid=guid,
+                extra_fields=extra_fields,
+            )
+        except db.NoteFieldError as e:
+            raise InvalidFieldError.from_db(e) from e
         conn.commit()
         return ReversedAddResult(
             note_id=note_id,
@@ -692,9 +801,13 @@ def _expand_cloze(
     new_ordinals = {num - 1 for num in cloze_nums}
 
     # Check for existing note (dedup on guid)
-    existing = conn.execute("SELECT id FROM notes WHERE guid = ?", (guid,)).fetchone()
+    existing = conn.execute("SELECT id, flds FROM notes WHERE guid = ?", (guid,)).fetchone()
     if existing:
         note_id = int(existing["id"])
+        # Keep Back Extra (and any other non-text field) set via update_card.
+        old_tail = str(existing["flds"]).split("\x1f")[1:]
+        if any(old_tail):
+            note_flds = "\x1f".join([text, *old_tail])
         conn.execute(
             "UPDATE notes SET flds=?, sfld=?, tags=?, mod=?, usn=-1 WHERE id=?",
             (note_flds, text, tags, now, note_id),
@@ -976,8 +1089,13 @@ def update_card(
     answer: str | None = None,
     tags: str | None = None,
     deck: str | None = None,
+    fields: dict[str, str] | None = None,
 ) -> CardDetail:
-    """Update card fields. Raises CardNotFoundError if not found."""
+    """Update card fields. Raises CardNotFoundError if not found.
+
+    `fields` maps exact note-field names to new values ("" clears). See
+    db.update_card for name resolution; failures raise InvalidFieldError.
+    """
     with _open_db(db_path) as conn:
         deck_id: int | None = None
         if deck is not None:
@@ -987,10 +1105,18 @@ def update_card(
 
         try:
             result = db.update_card(
-                conn, card_id, question=question, answer=answer, tags=tags, deck_id=deck_id
+                conn,
+                card_id,
+                question=question,
+                answer=answer,
+                tags=tags,
+                deck_id=deck_id,
+                fields=fields,
             )
         except db.ClozeUpdateNotSupportedError as e:
             raise UpdateClozeCardError(e.card_id) from e
+        except db.NoteFieldError as e:
+            raise InvalidFieldError.from_db(e) from e
         if not result:
             raise CardNotFoundError(card_id)
         conn.commit()
@@ -1102,16 +1228,61 @@ def export_deck(
     )
 
 
+_PACKAGE_SUFFIXES = (".apkg", ".colpkg")
+_LEGACY_STUB_TEXT = "Please update to the latest Anki version"
+
+
+def _is_legacy_stub(conn: sqlite3.Connection) -> bool:
+    """True iff the collection holds only Anki's "please update" placeholder note.
+
+    Modern Anki exports ship this one-note collection.anki2 next to the real
+    collection.anki21b so that old clients show a message instead of failing.
+    """
+    try:
+        rows = conn.execute("SELECT flds FROM notes LIMIT 2").fetchall()
+    except sqlite3.DatabaseError:
+        return False
+    if len(rows) != 1:
+        return False
+    first_field = str(rows[0][0]).split("\x1f", 1)[0]
+    return first_field.lstrip().startswith(_LEGACY_STUB_TEXT)
+
+
+def _check_extracted_collection(extracted: Path, db_path: Path) -> None:
+    """Reject placeholder or split-table collections before db_path is touched."""
+    try:
+        # Read-only: the extracted file is what gets copied to db_path.
+        conn = sqlite3.connect(f"{extracted.as_uri()}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.DatabaseError:
+        return  # Not SQLite; leave the failure to the normal open path.
+    try:
+        if _is_legacy_stub(conn):
+            raise ModernPackageError()
+        try:
+            modern = db.is_modern_anki_schema(conn)
+        except sqlite3.DatabaseError:
+            modern = False
+        if modern:
+            raise UnsupportedCollectionFormatError(db_path)
+    finally:
+        conn.close()
+
+
 def open_deck(db_path: Path, apkg_path: Path, *, force: bool = False) -> OpenResult:
-    """Extract an .apkg ZIP and copy the SQLite DB to db_path, adding extension tables.
+    """Extract an .apkg/.colpkg ZIP and copy the SQLite DB to db_path, adding extension tables.
 
     If db_path already exists with cards and force is False, raises an error.
+    Packages in Anki's modern format (collection.anki21b only, or a lone
+    "please update" placeholder collection) are refused before db_path is
+    touched.
     """
     if not apkg_path.exists():
         raise ApkgImportError(f"File not found: {apkg_path}")
-    if apkg_path.suffix.lower() != ".apkg":
+    if apkg_path.suffix.lower() not in _PACKAGE_SUFFIXES:
         raise ApkgImportError(
-            f"Expected .apkg file, got '{apkg_path.suffix or 'no extension'}': {apkg_path.name}"
+            f"Expected .apkg file (or .colpkg), got "
+            f"'{apkg_path.suffix or 'no extension'}': {apkg_path.name}"
         )
 
     # Check if target db exists and has cards
@@ -1128,10 +1299,12 @@ def open_deck(db_path: Path, apkg_path: Path, *, force: bool = False) -> OpenRes
         except sqlite3.OperationalError:
             pass  # No cards table -- safe to overwrite
 
-    # Extract the .apkg ZIP
+    # Extract the package ZIP
     try:
         with zipfile.ZipFile(str(apkg_path), "r") as zf:
             names = zf.namelist()
+            if "collection.anki21" not in names and "collection.anki21b" in names:
+                raise ModernPackageError()
             # Anki 2.1+ uses collection.anki21, older uses collection.anki2
             collection_name: str | None = None
             for candidate in ("collection.anki21", "collection.anki2"):
@@ -1148,6 +1321,7 @@ def open_deck(db_path: Path, apkg_path: Path, *, force: bool = False) -> OpenRes
             with tempfile.TemporaryDirectory() as tmpdir:
                 zf.extract(collection_name, tmpdir)
                 extracted = Path(tmpdir) / collection_name
+                _check_extracted_collection(extracted, db_path)
                 shutil.copy2(str(extracted), str(db_path))
     except zipfile.BadZipFile as e:
         raise ApkgImportError(f"Invalid .apkg file: {e}") from e

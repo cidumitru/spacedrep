@@ -34,14 +34,18 @@ def list_decks(
 
 @deck_app.command("import")
 def import_deck(
-    path: Path = typer.Argument(..., help="Path to .apkg file"),
+    path: Path = typer.Argument(..., help="Path to .apkg or .colpkg file"),
     force: bool = typer.Option(
         False, "--force", help="Replace existing database without safety check"
     ),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Output card count only"),
     db: Path = DB_DEFAULT,
 ) -> None:
-    """Open an .apkg deck file as the working database.
+    """Open an .apkg (or .colpkg) deck file as the working database.
+
+    Packages in Anki's modern format (collection.anki21b) are refused with
+    import_error: re-export from Anki Desktop with "Support older Anki
+    versions" checked. The working database is left untouched.
 
     Example:
         spacedrep deck import ~/Downloads/DSA_FAANG.apkg

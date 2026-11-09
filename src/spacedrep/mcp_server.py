@@ -132,6 +132,41 @@ def _validate_file_path(path_str: str, *, must_exist: bool = False) -> Path:
     return resolved
 
 
+_EXTRA_FIELDS_DESC = (
+    'Extra note fields as a JSON object string, e.g. {"Source": "SICP 1.2"}. '
+    "Names are case-sensitive; returned under extra_fields by get_card/get_next_card. "
+    "Empty string for none."
+)
+_EXTRA_FIELDS_HINT = 'Pass a JSON object of strings, e.g. {"Source": "SICP 1.2"}'
+
+
+def _parse_extra_fields(raw: str) -> dict[str, str] | None:
+    """Parse an extra_fields_json argument ("" -> None)."""
+    if not raw.strip():
+        return None
+    try:
+        data: object = _json.loads(raw)
+    except ValueError as e:
+        raise core.InvalidFieldError(
+            f"extra_fields_json is not valid JSON: {e}", suggestion=_EXTRA_FIELDS_HINT
+        ) from e
+    if not isinstance(data, dict):
+        raise core.InvalidFieldError(
+            "extra_fields_json must be a JSON object", suggestion=_EXTRA_FIELDS_HINT
+        )
+    result: dict[str, str] = {}
+    items: list[tuple[object, object]] = list(data.items())  # pyright: ignore[reportUnknownArgumentType, reportUnknownMemberType]
+    for key, value in items:
+        if not isinstance(value, str):
+            raise core.InvalidFieldError(
+                f"extra_fields_json value for {key!r} must be a string",
+                field=str(key),
+                suggestion=_EXTRA_FIELDS_HINT,
+            )
+        result[str(key)] = value
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Card tools
 # ---------------------------------------------------------------------------
@@ -144,6 +179,7 @@ def add_card(
     answer: str,
     deck: Annotated[str, Field(description="Deck name (created if new)")] = "Default",
     tags: Annotated[str, Field(description="Space-separated tag names")] = "",
+    extra_fields_json: Annotated[str, Field(description=_EXTRA_FIELDS_DESC)] = "",
 ) -> dict[str, Any]:
     """Add a new basic flashcard (one Q→A direction). Re-adding the same question
     to the same deck updates the existing card instead of creating a duplicate.
@@ -159,8 +195,18 @@ def add_card(
     it to basic.
 
     Tags are space-separated. Use :: for hierarchy (e.g. 'foundations::rag').
+    extra_fields_json stores additional note fields (examples, sources, mnemonics);
+    new names are added to the note type. A re-add keeps extras already on
+    the note unless it sets them again.
     Returns the card ID, deck name, and was_update flag."""
-    return core.add_card(_db_path(), question, answer, deck=deck, tags=tags)
+    return core.add_card(
+        _db_path(),
+        question,
+        answer,
+        deck=deck,
+        tags=tags,
+        extra_fields=_parse_extra_fields(extra_fields_json),
+    )
 
 
 @mcp.tool()
@@ -170,6 +216,7 @@ def add_reversed_card(
     answer: str,
     deck: Annotated[str, Field(description="Deck name (created if new)")] = "Default",
     tags: Annotated[str, Field(description="Space-separated tag names")] = "",
+    extra_fields_json: Annotated[str, Field(description=_EXTRA_FIELDS_DESC)] = "",
 ) -> dict[str, Any]:
     """Add a reversed card pair. Creates 2 cards from 1 shared note:
     one Q→A and one A→Q. Use for vocabulary or any concept where you
@@ -189,7 +236,16 @@ def add_reversed_card(
     it to reversed.
 
     Returns note_id, card_ids (both directions), card_count (=2), deck."""
-    return _serialize(core.add_reversed_card(_db_path(), question, answer, deck=deck, tags=tags))
+    return _serialize(
+        core.add_reversed_card(
+            _db_path(),
+            question,
+            answer,
+            deck=deck,
+            tags=tags,
+            extra_fields=_parse_extra_fields(extra_fields_json),
+        )
+    )
 
 
 @mcp.tool()
@@ -202,7 +258,9 @@ def add_cards_bulk(
             'Basic: {"question":"...","answer":"...","deck":"...","tags":"..."}. '
             'Cloze: {"question":"{{c1::...}}","type":"cloze","deck":"...","tags":"..."}. '
             'Reversed: {"question":"...","answer":"...","type":"reversed",'
-            '"deck":"...","tags":"..."} — creates 2 cards (Q→A and A→Q).'
+            '"deck":"...","tags":"..."} — creates 2 cards (Q→A and A→Q). '
+            'Basic and reversed items accept "extra_fields":{"Name":"value"}; '
+            "cloze items reject it."
         ),
     ],
 ) -> dict[str, Any]:
@@ -210,7 +268,8 @@ def add_cards_bulk(
     answer, deck (optional), tags (optional), type (optional: 'basic',
     'cloze', or 'reversed'). When type='cloze', question contains cloze
     text and answer is ignored. When type='reversed', two cards are
-    created from one shared note (Q→A and A→Q).
+    created from one shared note (Q→A and A→Q). Basic and reversed items
+    may carry extra_fields ({name: value}); cloze items may not.
 
     A cross_model_collision error (basic ↔ reversed with the same
     (question, deck)) aborts the entire batch — no partial inserts.
@@ -449,10 +508,24 @@ def update_card(
     answer: Annotated[str, Field(description="New answer text")] = "",
     tags: Annotated[str, Field(description="New space-separated tags")] = "",
     deck: Annotated[str, Field(description="Move card to this deck")] = "",
+    extra_fields_json: Annotated[
+        str,
+        Field(
+            description='Note fields to set, as a JSON object string, e.g. {"Source": "x"}; '
+            "an empty value clears that field. Names must match the note type exactly."
+        ),
+    ] = "",
 ) -> dict[str, Any]:
-    """Update a flashcard's question, answer, tags, or deck (use after add_card
-    or add_reversed_card to fix typos, retag, or move between decks). Only
-    non-empty fields are changed. Provide at least one field to update.
+    """Update a flashcard's question, answer, tags, deck, or extra fields (use
+    after add_card or add_reversed_card to fix typos, retag, or move between
+    decks). Only non-empty question/answer/tags/deck are changed. Provide at
+    least one field to update.
+
+    extra_fields_json sets other note fields by exact, case-sensitive name ("" clears
+    one). On spacedrep's own notes an unknown name adds the field; on imported
+    Anki note types it is an `invalid_field` error listing the note type's
+    fields. A field that renders as this card's question or answer is refused —
+    use question/answer for those.
 
     Field resolution is template-aware. For a reversed card, `question`
     updates the field that renders as *that* card's front (ord=0 writes
@@ -470,9 +543,20 @@ def update_card(
     a = _or_none(answer)
     t = _or_none(tags)
     d = _or_none(deck)
-    if q is None and a is None and t is None and d is None:
+    fields = _parse_extra_fields(extra_fields_json)
+    if q is None and a is None and t is None and d is None and not fields:
         raise core.NoFieldsProvidedError()
-    return _serialize(core.update_card(_db_path(), card_id, question=q, answer=a, tags=t, deck=d))
+    return _serialize(
+        core.update_card(
+            _db_path(),
+            card_id,
+            question=q,
+            answer=a,
+            tags=t,
+            deck=d,
+            fields=fields or None,
+        )
+    )
 
 
 @mcp.tool()
@@ -594,14 +678,18 @@ def list_decks() -> dict[str, object]:
 @mcp.tool()
 @_handle_errors
 def import_deck(
-    apkg_path: Annotated[str, Field(description="Absolute path to .apkg file on disk")],
+    apkg_path: Annotated[
+        str, Field(description="Absolute path to .apkg (or .colpkg) file on disk")
+    ],
     force: Annotated[
         bool, Field(description="Replace existing database without safety check")
     ] = False,
 ) -> dict[str, Any]:
     """Open an Anki .apkg deck file as the working database. Replaces the
     current database. Use force=True to overwrite a database that already
-    has cards."""
+    has cards. Packages in Anki's modern format (collection.anki21b) are
+    refused with import_error and the database is left untouched: re-export
+    from Anki Desktop with "Support older Anki versions" checked."""
     validated = _validate_file_path(apkg_path, must_exist=True)
     return _serialize(core.open_deck(_db_path(), validated, force=force))
 

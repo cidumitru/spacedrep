@@ -15,6 +15,12 @@ DRY_RUN_OPT = typer.Option(
 )
 
 
+FIELD_OPT_HELP = (
+    "Extra note field as NAME=VALUE (repeatable; split on the first '='). "
+    "Names are case-sensitive; an empty VALUE stores an empty field."
+)
+
+
 def _parse_tags(tags: str | None) -> list[str] | None:
     """Parse space-separated tags string into a list, or None if empty."""
     if not tags:
@@ -72,6 +78,7 @@ def add_card(
     answer: str = typer.Argument(..., help="The card answer"),
     deck: str = typer.Option("Default", help="Deck name"),
     tags: str = typer.Option("", help="Space-separated tags"),
+    field: list[str] | None = typer.Option(None, "--field", help=FIELD_OPT_HELP),
     quiet: bool = QUIET_OPT,
     db: Path = DB_DEFAULT,
 ) -> None:
@@ -82,12 +89,19 @@ def add_card(
     cross_model_collision if a reversed note with the same (question, deck)
     already exists.
 
+    `--field NAME=VALUE` stores extra note fields (returned under
+    extra_fields by `card get` / `card next`). New names are added to the
+    note type and shown on the answer side in Anki. A re-add keeps extras
+    already on the note unless it sets them again.
+
     Example:
         spacedrep card add "Why eventual consistency?" "Availability tradeoff" --deck AWS --tags s3
+        spacedrep card add "Q" "A" --field Source="SICP 1.2" --field Example="(f 1)"
         spacedrep card add "Q" "A" -q
     """
     try:
-        result = core.add_card(db, question, answer, deck=deck, tags=tags)
+        extra = core.parse_field_options(field)
+        result = core.add_card(db, question, answer, deck=deck, tags=tags, extra_fields=extra)
         if quiet:
             output_quiet(result["card_id"])
         else:
@@ -104,8 +118,13 @@ def add_bulk(
 ) -> None:
     """Add multiple cards from JSON on stdin.
 
+    Each item: question, answer, deck?, tags?, type? (basic | reversed |
+    cloze), extra_fields? ({"NAME": "VALUE"}; basic and reversed only).
+
     Example:
         echo '[{"question":"Q1","answer":"A1","deck":"AWS"}]' | spacedrep card add-bulk
+        echo '[{"question":"Q","answer":"A","extra_fields":{"Source":"SICP"}}]' \\
+            | spacedrep card add-bulk
         echo '[{"question":"Q1","answer":"A1"}]' | spacedrep card add-bulk -q
     """
     import sys as _sys
@@ -304,10 +323,18 @@ def update_card(
     answer: str | None = typer.Option(None, help="New answer text"),
     tags: str | None = typer.Option(None, help="New space-separated tags"),
     deck: str | None = typer.Option(None, help="Move to deck"),
+    field: list[str] | None = typer.Option(
+        None,
+        "--field",
+        help=(
+            "Set a note field as NAME=VALUE (repeatable; empty VALUE clears it). "
+            "NAME must match the note type's field exactly."
+        ),
+    ),
     quiet: bool = QUIET_OPT,
     db: Path = DB_DEFAULT,
 ) -> None:
-    """Update a card's question, answer, tags, or deck.
+    """Update a card's question, answer, tags, deck, or extra fields.
 
     Field resolution is template-aware: `--question` edits whichever
     note field renders as *this* card's front. For a reversed pair
@@ -316,16 +343,31 @@ def update_card(
     (splitting them would be silently reverted on the next re-add).
     Cloze cards are rejected — use `card update-cloze` instead.
 
+    `--field NAME=VALUE` sets any other field of the card's note (case-
+    sensitive, exact name); `--field NAME=` clears it. On spacedrep's own
+    notes an unknown NAME adds the field; on imported Anki note types it
+    is an error listing the note type's fields. A field that renders as
+    this card's question or answer must be changed with --question /
+    --answer.
+
     Example:
         spacedrep card update 1 --question "Updated question" --deck DSA
+        spacedrep card update 1 --field Source="SICP 1.3" --field Example=
     """
-    if question is None and answer is None and tags is None and deck is None:
+    if question is None and answer is None and tags is None and deck is None and not field:
         err = core.NoFieldsProvidedError()
         output_error(err)
         raise typer.Exit(code=err.exit_code) from None
     try:
+        fields = core.parse_field_options(field)
         result = core.update_card(
-            db, card_id, question=question, answer=answer, tags=tags, deck=deck
+            db,
+            card_id,
+            question=question,
+            answer=answer,
+            tags=tags,
+            deck=deck,
+            fields=fields or None,
         )
         if quiet:
             output_quiet(result.card_id)
@@ -435,6 +477,7 @@ def add_reversed(
     answer: str = typer.Argument(..., help="The card answer"),
     deck: str = typer.Option("Default", help="Deck name"),
     tags: str = typer.Option("", help="Space-separated tags"),
+    field: list[str] | None = typer.Option(None, "--field", help=FIELD_OPT_HELP),
     quiet: bool = QUIET_OPT,
     db: Path = DB_DEFAULT,
 ) -> None:
@@ -452,11 +495,17 @@ def add_reversed(
     Raises cross_model_collision if a basic note with the same
     (question, deck) already exists; delete that card first.
 
+    `--field NAME=VALUE` stores extra note fields, as for `card add`.
+
     Example:
         spacedrep card add-reversed "Capital of France" "Paris" --deck geo
+        spacedrep card add-reversed "chat" "cat" --deck fr --field Gender=m
     """
     try:
-        result = core.add_reversed_card(db, question, answer, deck=deck, tags=tags)
+        extra = core.parse_field_options(field)
+        result = core.add_reversed_card(
+            db, question, answer, deck=deck, tags=tags, extra_fields=extra
+        )
         if quiet:
             output_quiet(result.card_ids)
         else:
