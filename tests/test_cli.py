@@ -846,3 +846,54 @@ class TestEnvVar:
             data = json.loads(result.stdout)
             deck_names = {d["name"] for d in data["decks"]}
             assert "env-deck" in deck_names
+
+
+class TestCardFieldOption:
+    def test_add_get_update_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            _init_db(db_path)
+            result = _run(
+                ["card", "add", "Q", "A", "--field", "Source=SICP 1.2", "--field", "Expr=a=b"],
+                db_path,
+            )
+            assert result.returncode == 0, result.stderr
+            added = json.loads(result.stdout)
+            assert set(added) == {"card_id", "deck", "was_update"}
+            card_id = str(added["card_id"])
+
+            got = json.loads(_run(["card", "get", card_id], db_path).stdout)
+            assert got["extra_fields"] == {"Source": "SICP 1.2", "Expr": "a=b"}
+
+            result = _run(
+                ["card", "update", card_id, "--field", "Source=SICP 1.3", "--field", "Expr="],
+                db_path,
+            )
+            assert result.returncode == 0, result.stderr
+            assert json.loads(result.stdout)["extra_fields"] == {"Source": "SICP 1.3"}
+
+    def test_update_field_rejects_answer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            _init_db(db_path)
+            card_id = _add_card(db_path, "Q", "A")
+            result = _run(["card", "update", str(card_id), "--field", "Answer=x"], db_path)
+            assert result.returncode == 2
+            err = json.loads(result.stderr)
+            assert err["error"] == "invalid_field"
+            assert "--question / --answer" in err["message"]
+
+    def test_field_without_equals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            _init_db(db_path)
+            result = _run(["card", "add", "Q", "A", "--field", "Source"], db_path)
+            assert result.returncode == 2
+            assert json.loads(result.stderr)["error"] == "invalid_field"
+
+    def test_help_mentions_field(self) -> None:
+        for cmd in ("add", "update", "add-reversed"):
+            result = _run_bare(["card", cmd, "--help"])
+            assert result.returncode == 0
+            assert "--field" in result.stdout
+            assert "NAME=VALUE" in result.stdout

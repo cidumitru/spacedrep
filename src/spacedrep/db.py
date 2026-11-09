@@ -9,6 +9,7 @@ columns — no separate fsrs_state table.
 import json
 import sqlite3
 import time
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from fsrs import Card
 from spacedrep import fsrs_engine
 from spacedrep.anki_render import (
     ModelInfo,
+    find_cloze_field,
     render_card,
     resolve_card_qa_fields,
 )
@@ -26,7 +28,9 @@ from spacedrep.anki_schema import (
     BASIC_MODEL_ID,
     BASIC_REVERSED_MODEL_ID,
     CLOZE_MODEL_ID,
+    GROWABLE_MODEL_IDS,
     ColMeta,
+    FieldNameCaseClashError,
     anki_fields_to_fsrs_card,
     due_to_datetime,
     fsrs_card_to_anki_fields,
@@ -62,6 +66,33 @@ class ClozeUpdateNotSupportedError(Exception):
     def __init__(self, card_id: int) -> None:
         super().__init__(f"Cloze update not supported for card {card_id}")
         self.card_id = card_id
+
+
+FIELD_NAME_SUGGESTION = (
+    "Use a non-empty name without whitespace, '\\x1f', '{', '}', ':' or '\"', "
+    "not starting with '#', '/' or '^'"
+)
+
+
+class NoteFieldError(Exception):
+    """Raised for an unusable extra field name/value on add or update.
+
+    Core translates this to InvalidFieldError for the CLI/MCP surface.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        field: str | None = None,
+        suggestion: str = "",
+        available: list[str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.field = field
+        self.suggestion = suggestion
+        self.available = available
 
 
 class ModernSchemaError(Exception):
@@ -342,6 +373,78 @@ def find_cross_model_conflict(
     return (int(row["card_id"]), int(row["mid"]))
 
 
+def _grow_model_for_extras(
+    meta: ColMeta, mid: int, extra_fields: Mapping[str, str] | None
+) -> list[str]:
+    """Validate extras for an add and grow the model; return its field names.
+
+    Names that are the model's question/answer fields (ord 0/1) are refused —
+    those are set through the question/answer arguments.
+    """
+    names = meta.model_field_names(mid)
+    if not extra_fields:
+        return names
+    _check_field_values(extra_fields)
+    for name in extra_fields:
+        if name in names[:2]:
+            side = "question" if name == names[0] else "answer"
+            raise NoteFieldError(
+                f"Field {name!r} is the card's {side}; set it with the {side} argument",
+                field=name,
+                suggestion="Pass it as the question/answer argument instead of --field",
+            )
+    try:
+        return meta.grow_model_fields(mid, extra_fields.keys())
+    except ValueError as e:
+        raise _field_name_error(e, list(extra_fields)) from e
+
+
+def _check_field_values(fields: Mapping[str, str]) -> None:
+    """Refuse values containing Anki's field separator (they would split the note)."""
+    for name, value in fields.items():
+        if "\x1f" in value:
+            raise NoteFieldError(
+                f"Value for field {name!r} contains the field separator \\x1f",
+                field=name,
+                suggestion="Remove the \\x1f character from the value",
+            )
+
+
+def _field_name_error(e: ValueError, candidates: list[str]) -> NoteFieldError:
+    """Turn a grow_model_fields ValueError into a NoteFieldError."""
+    if isinstance(e, FieldNameCaseClashError):
+        return NoteFieldError(
+            str(e), field=e.name, suggestion=f"Use the existing field name {e.existing!r}"
+        )
+    name = next((n for n in candidates if repr(n) in str(e)), None)
+    return NoteFieldError(str(e), field=name, suggestion=FIELD_NAME_SUGGESTION)
+
+
+def _compose_flds(
+    question: str,
+    answer: str,
+    field_names: list[str],
+    extra_fields: Mapping[str, str] | None,
+    existing_flds: str | None,
+) -> str:
+    """Build a basic/reversed note's flds, keeping extras already on the note.
+
+    Without extras (new or kept) the note stays two fields long. With any
+    extra, the note is padded with empty strings to the model's length.
+    """
+    tail: list[str] = []
+    if existing_flds is not None:
+        tail = existing_flds.split("\x1f")[2:]
+    if not extra_fields and not any(tail):
+        return f"{question}\x1f{answer}"
+    parts = [question, answer, *tail]
+    if len(parts) < len(field_names):
+        parts.extend([""] * (len(field_names) - len(parts)))
+    for name, value in (extra_fields or {}).items():
+        parts[field_names.index(name)] = value
+    return "\x1f".join(parts)
+
+
 def insert_card(
     conn: sqlite3.Connection,
     *,
@@ -353,8 +456,13 @@ def insert_card(
     source: CardSource = "manual",
     guid: str,
     note_flds: str | None = None,
+    extra_fields: Mapping[str, str] | None = None,
 ) -> tuple[int, bool]:
     """Insert a card (note + card row). Dedup on notes.guid.
+
+    extra_fields (basic only) are stored after Question/Answer, growing the
+    model's field list on demand. On a dedup re-add, extras already on the
+    note are kept unless overwritten.
 
     Returns (card_id, was_update).
     """
@@ -363,16 +471,27 @@ def insert_card(
     meta = load_col_meta(conn)
     did = meta.ensure_deck(deck_name)
     mid = meta.ensure_model(model_type)
+    field_names = _grow_model_for_extras(meta, mid, extra_fields) if model_type != "cloze" else []
     save_col_meta(conn, meta)
-
-    # Build flds
-    if note_flds is None:
-        note_flds = f"{question}\x1f" if model_type == "cloze" else f"{question}\x1f{answer}"
 
     sfld = question
 
     # Dedup on guid
-    existing = conn.execute("SELECT id FROM notes WHERE guid = ?", (guid,)).fetchone()
+    existing = conn.execute("SELECT id, flds FROM notes WHERE guid = ?", (guid,)).fetchone()
+
+    # Build flds
+    if note_flds is None:
+        if model_type == "cloze":
+            note_flds = f"{question}\x1f"
+        else:
+            note_flds = _compose_flds(
+                question,
+                answer,
+                field_names,
+                extra_fields,
+                str(existing["flds"]) if existing else None,
+            )
+
     if existing:
         note_id = int(existing["id"])
         if tags:
@@ -465,13 +584,14 @@ def insert_reversed_note(
     tags: str = "",
     source: CardSource = "manual",
     guid: str,
+    extra_fields: Mapping[str, str] | None = None,
 ) -> tuple[int, list[int], bool]:
     """Insert or update a reversed note (1 note + 2 cards, ord=[0, 1]).
 
     Dedup on notes.guid. On update, the note's Question/Answer fields are
     rewritten (both rendered cards reflect the change), and the deck is
     moved to match. Any missing ordinal among {0, 1} is filled in so the
-    pair is always intact.
+    pair is always intact. extra_fields behave as in insert_card.
 
     Returns (note_id, [card_id_ord0, card_id_ord1], was_update).
     """
@@ -480,12 +600,14 @@ def insert_reversed_note(
     meta = load_col_meta(conn)
     did = meta.ensure_deck(deck_name)
     mid = meta.ensure_model("reversed")
+    field_names = _grow_model_for_extras(meta, mid, extra_fields)
     save_col_meta(conn, meta)
 
-    note_flds = f"{question}\x1f{answer}"
+    existing = conn.execute("SELECT id, flds FROM notes WHERE guid = ?", (guid,)).fetchone()
+    note_flds = _compose_flds(
+        question, answer, field_names, extra_fields, str(existing["flds"]) if existing else None
+    )
     sfld = question
-
-    existing = conn.execute("SELECT id FROM notes WHERE guid = ?", (guid,)).fetchone()
     if existing:
         note_id = int(existing["id"])
         if tags:
@@ -852,6 +974,66 @@ def get_card_detail(conn: sqlite3.Connection, card_id: int) -> CardDetail | None
 # ---------------------------------------------------------------------------
 
 
+def _resolve_update_fields(
+    conn: sqlite3.Connection,
+    minfo: ModelInfo | None,
+    mid: int,
+    ord_val: int,
+    parts: list[str],
+    fields: Mapping[str, str],
+) -> list[str]:
+    """Check `fields` against the note's model; grow spacedrep models on demand.
+
+    Returns the model's field names (after any growth). Raises NoteFieldError.
+    """
+    meta = load_col_meta(conn)
+    model_name = str(meta.models.get(str(mid), {}).get("name", mid))
+    if minfo is None:
+        raise NoteFieldError(
+            f"Note type {mid} of this card is missing from the collection",
+            suggestion="The note's model is unknown; its fields cannot be resolved",
+        )
+    names = list(minfo.field_names)
+    _check_field_values(fields)
+
+    if minfo.model_type == 1:
+        cloze_idx = find_cloze_field(minfo, parts)
+        protected = {cloze_idx: "cloze text"}
+        protected_hint = "edit it with `card update-cloze` (update_cloze_note)"
+    else:
+        qi, ai = resolve_card_qa_fields(minfo, ord_val)
+        protected = {i: side for i, side in ((qi, "question"), (ai, "answer")) if i is not None}
+        protected_hint = "change it with --question / --answer (MCP: question / answer)"
+
+    for name in fields:
+        if name in names and names.index(name) in protected:
+            side = protected[names.index(name)]
+            raise NoteFieldError(
+                f"Field {name!r} renders as this card's {side}; {protected_hint}",
+                field=name,
+                suggestion=protected_hint[0].upper() + protected_hint[1:],
+            )
+
+    unknown = [n for n in fields if n not in names]
+    if not unknown:
+        return names
+    if mid not in GROWABLE_MODEL_IDS:
+        raise NoteFieldError(
+            f"Unknown field {unknown[0]!r} for note type {model_name!r}. "
+            f"Fields: {', '.join(names)}",
+            field=unknown[0],
+            suggestion="Field names are case-sensitive and must match the note type exactly",
+            available=names,
+        )
+    try:
+        grown = meta.grow_model_fields(mid, unknown)
+    except ValueError as e:
+        raise _field_name_error(e, unknown) from e
+    save_col_meta(conn, meta)
+    invalidate_model_cache(conn)
+    return grown
+
+
 def update_card(
     conn: sqlite3.Connection,
     card_id: int,
@@ -860,8 +1042,16 @@ def update_card(
     answer: str | None = None,
     tags: str | None = None,
     deck_id: int | None = None,
+    fields: Mapping[str, str] | None = None,
 ) -> bool:
     """Update card fields. Returns False if not found.
+
+    `fields` sets note fields by exact (case-sensitive) name; an empty value
+    clears the field. Names are resolved against the note's model. On
+    spacedrep's own basic/reversed models an unknown name grows the model;
+    on any other model it raises NoteFieldError listing the model's fields.
+    A field that renders as this card's question or answer (or a cloze
+    note's cloze text) is refused — use question/answer instead.
 
     Field resolution is template-aware: for multi-template notes (reversed
     pairs, custom imported note types) `question`/`answer` update the
@@ -889,8 +1079,13 @@ def update_card(
     parts = flds.split("\x1f")
 
     minfo: ModelInfo | None = None
-    if question is not None or answer is not None or deck_id is not None:
+    if question is not None or answer is not None or deck_id is not None or fields:
         minfo = _get_models(conn).get(mid_str)
+
+    # Validate --field names before any write so a bad name changes nothing.
+    field_names: list[str] = []
+    if fields:
+        field_names = _resolve_update_fields(conn, minfo, int(row["mid"]), ord_val, parts, fields)
 
     if question is not None or answer is not None:
         if minfo is not None and minfo.model_type == 1:
@@ -908,6 +1103,14 @@ def update_card(
             parts[qi] = question
         if answer is not None and ai < len(parts):
             parts[ai] = answer
+
+    if fields:
+        if len(parts) < len(field_names):
+            parts.extend([""] * (len(field_names) - len(parts)))
+        for name, value in fields.items():
+            parts[field_names.index(name)] = value
+
+    if question is not None or answer is not None or fields:
         new_flds = "\x1f".join(parts)
         sfld = parts[0] if parts else ""
         conn.execute(

@@ -5,14 +5,18 @@ metadata row, FSRS<->Anki field conversion, due date encoding/decoding, and
 deterministic GUID generation.
 """
 
+import copy
 import hashlib
 import json
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
 from fsrs import Card, State
+
+from spacedrep.anki_render import ANKI_SPECIAL_FIELDS
 
 # Anki's JSON blobs (col.models, col.decks, col.conf, col.dconf) have deeply
 # nested, externally-defined structure. Using Any for these is intentional —
@@ -39,6 +43,55 @@ def _json_or_empty(value: Any, default: Any) -> Any:
 BASIC_MODEL_ID = int(hashlib.sha256(b"spacedrep").hexdigest()[:8], 16)
 CLOZE_MODEL_ID = int(hashlib.sha256(b"spacedrep-cloze").hexdigest()[:8], 16)
 BASIC_REVERSED_MODEL_ID = int(hashlib.sha256(b"spacedrep-reversed").hexdigest()[:8], 16)
+
+
+# spacedrep's own non-cloze note types grow extra fields on demand
+# (card add/update --field). Question and Answer stay at ord 0 and 1.
+GROWABLE_MODEL_IDS = frozenset({BASIC_MODEL_ID, BASIC_REVERSED_MODEL_ID})
+
+_FORBIDDEN_FIELD_CHARS = ("\x1f", "{", "}", ":", '"')
+
+
+class FieldNameCaseClashError(ValueError):
+    """A new field name differs only in letter case from an existing field."""
+
+    def __init__(self, name: str, existing: str) -> None:
+        super().__init__(
+            f"Field name {name!r} differs only in case from existing field {existing!r}"
+        )
+        self.name = name
+        self.existing = existing
+
+
+def validate_field_name(name: str) -> None:
+    """Raise ValueError if name cannot become a new note-type field.
+
+    Rejects empty names, whitespace, the field separator, template syntax
+    characters ({ } :), double quotes, Anki's leading sigils (# / ^) and
+    Anki's built-in template names (FrontSide, Tags, ...).
+    """
+    if not name:
+        msg = "Field name cannot be empty"
+        raise ValueError(msg)
+    if any(ch.isspace() for ch in name):
+        msg = f"Field name {name!r} cannot contain whitespace"
+        raise ValueError(msg)
+    bad = [ch for ch in _FORBIDDEN_FIELD_CHARS if ch in name]
+    if bad:
+        shown = ", ".join(repr(ch) for ch in bad)
+        msg = f"Field name {name!r} cannot contain {shown}"
+        raise ValueError(msg)
+    if name[0] in "#/^":
+        msg = f"Field name {name!r} cannot start with {name[0]!r}"
+        raise ValueError(msg)
+    if name in ANKI_SPECIAL_FIELDS:
+        msg = f"Field name {name!r} is reserved by Anki templates"
+        raise ValueError(msg)
+
+
+def extra_field_template(name: str) -> str:
+    """Answer-template snippet that shows a grown field in Anki."""
+    return f'{{{{#{name}}}}}<div class="{name}">{{{{{name}}}}}</div>{{{{/{name}}}}}'
 
 
 def _deck_id_from_name(name: str) -> int:
@@ -510,6 +563,70 @@ class ColMeta:
             self.mod = int(time.time())
 
         return mid
+
+    def model_field_names(self, mid: int) -> list[str]:
+        """Field names of a model, in ord order ([] if the model is unknown)."""
+        model = self.models.get(str(mid))
+        if model is None:
+            return []
+        return [str(f["name"]) for f in model.get("flds", [])]
+
+    def grow_model_fields(self, mid: int, names: Iterable[str]) -> list[str]:
+        """Append any of names missing from a spacedrep basic/reversed model.
+
+        Each new field is appended to the model's flds (existing fields are
+        never reordered or renamed) and shown on every answer template via
+        extra_field_template(), so an Anki export displays it.
+
+        Returns the model's field names after growing.
+
+        Raises:
+            ValueError: if the model is not growable, a new name is invalid,
+                or it differs only in case from an existing field.
+        """
+        if mid not in GROWABLE_MODEL_IDS:
+            msg = f"Model {mid} does not accept new fields"
+            raise ValueError(msg)
+        current = self.model_field_names(mid)
+        lowered = {n.lower(): n for n in current}
+        missing: list[str] = []
+        for name in names:
+            if name in current or name in missing:
+                continue
+            validate_field_name(name)
+            clash = lowered.get(name.lower())
+            if clash is not None:
+                raise FieldNameCaseClashError(name, clash)
+            lowered[name.lower()] = name
+            missing.append(name)
+        if not missing:
+            return current
+
+        # Deep-copy: models may share the module-level default dicts.
+        model = copy.deepcopy(self.models[str(mid)])
+        flds: list[AnkiJson] = model["flds"]
+        tmpls: list[AnkiJson] = model.get("tmpls", [])
+        for name in missing:
+            flds.append(
+                {
+                    "name": name,
+                    "ord": len(flds),
+                    "sticky": False,
+                    "rtl": False,
+                    "font": "Arial",
+                    "size": 20,
+                    "media": [],
+                }
+            )
+            snippet = extra_field_template(name)
+            for tmpl in tmpls:
+                tmpl["afmt"] = f"{tmpl.get('afmt', '')}{snippet}"
+        now = int(time.time())
+        model["mod"] = now
+        model["usn"] = -1
+        self.models[str(mid)] = model
+        self.mod = now
+        return [str(f["name"]) for f in flds]
 
 
 # ---------------------------------------------------------------------------

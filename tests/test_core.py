@@ -653,11 +653,11 @@ def test_open_deck_html_fields_still_stripped(tmp_db: Path, html_apkg: Path) -> 
     """Notes under Anki's own note types hold HTML and keep rendering stripped."""
     core.open_deck(tmp_db, html_apkg, force=True)
     basic = core.get_card_detail(tmp_db, 20)
-    assert (basic.question, basic.answer) == ("bold x", "back")
+    assert (basic.question, basic.answer) == ("bold\nx", "back")
     forward = core.get_card_detail(tmp_db, 21)
-    assert (forward.question, forward.answer) == ("bold x", "italic")
+    assert (forward.question, forward.answer) == ("bold\nx", "italic")
     reverse = core.get_card_detail(tmp_db, 22)
-    assert (reverse.question, reverse.answer) == ("italic", "bold x")
+    assert (reverse.question, reverse.answer) == ("italic", "bold\nx")
     cloze = core.get_card_detail(tmp_db, 23)
     assert (cloze.question, cloze.answer) == ("[...] text", "bold text")
     assert cloze.extra_fields == {"Extra": "extra"}

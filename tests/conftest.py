@@ -428,3 +428,62 @@ def html_apkg(tmp_path_factory: pytest.TempPathFactory) -> Path:
             (23, 502, 1, 0, 0),  # cloze c1
         ],
     )
+
+
+NOTES_MODEL: dict[str, Any] = {
+    "4000": {
+        "id": 4000,
+        "name": "Basic+Notes",
+        "type": 0,
+        "flds": [
+            {"name": "Front", "ord": 0},
+            {"name": "Back", "ord": 1},
+            {"name": "Notes", "ord": 2},
+        ],
+        "tmpls": [
+            {
+                "name": "Card 1",
+                "qfmt": "{{Front}}",
+                "afmt": "{{FrontSide}}<hr>{{Back}}<br>{{Notes}}",
+            }
+        ],
+    }
+}
+
+
+@pytest.fixture(scope="session")
+def notes_field_apkg(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Synthetic .apkg with an imported 3-field note type (Front, Back, Notes)."""
+    tmp = tmp_path_factory.mktemp("apkg")
+    return build_anki_apkg(
+        tmp,
+        "notes",
+        models=NOTES_MODEL,
+        decks=DEFAULT_DECK,
+        notes=[(600, "4000", "front\x1fback\x1f<i>old note</i>", "guidN1", "")],
+        cards=[(30, 600, 1, 0, 0)],
+    )
+
+
+@pytest.fixture(scope="session")
+def legacy_stub_db(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """SQLite file shaped like the collection.anki2 stub in modern Anki exports."""
+    tmp = tmp_path_factory.mktemp("stub")
+    build_anki_apkg(
+        tmp,
+        "stub",
+        models=BASIC_MODEL,
+        decks=DEFAULT_DECK,
+        notes=[
+            (
+                700,
+                "1000",
+                "Please update to the latest Anki version, then import the .colpkg/.apkg "
+                "file again.\x1f",
+                "guidStub",
+                "",
+            )
+        ],
+        cards=[(40, 700, 1, 0, 0)],
+    )
+    return tmp / "stub.anki21"

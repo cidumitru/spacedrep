@@ -708,3 +708,52 @@ class TestUpdateCardClozeRejected:
         cid = result["card_ids"][0]
         with pytest.raises(ToolError, match="update_cloze_card"):
             update_card(cid, question="new")
+
+
+class TestExtraFields:
+    def test_add_card_with_extra_fields(self, tmp_db: Path) -> None:
+        added = add_card("Q", "A", extra_fields_json='{"Source": "SICP", "Example": "(f 1)"}')
+        assert set(added) == {"card_id", "deck", "was_update"}
+        result = get_card(added["card_id"])
+        assert result["extra_fields"] == {"Source": "SICP", "Example": "(f 1)"}
+
+    def test_add_reversed_with_extra_fields(self, tmp_db: Path) -> None:
+        r = add_reversed_card("chat", "cat", extra_fields_json='{"Gender": "m"}')
+        for cid in r["card_ids"]:
+            assert get_card(cid)["extra_fields"] == {"Gender": "m"}
+
+    def test_update_card_extra_fields_only(self, tmp_db: Path) -> None:
+        added = add_card("Q", "A", extra_fields_json='{"Source": "s", "Example": "e"}')
+        result = update_card(added["card_id"], extra_fields_json='{"Source": "s2", "Example": ""}')
+        assert result["extra_fields"] == {"Source": "s2"}
+
+    def test_update_card_question_field_rejected(self, tmp_db: Path, card_id: int) -> None:
+        with pytest.raises(ToolError, match="invalid_field"):
+            update_card(card_id, extra_fields_json='{"Question": "x"}')
+
+    def test_update_card_empty_object_is_no_fields(self, tmp_db: Path, card_id: int) -> None:
+        with pytest.raises(ToolError, match="no_fields"):
+            update_card(card_id, extra_fields_json="{}")
+
+    @pytest.mark.parametrize("raw", ["not json", "[1]", '{"A": 1}'])
+    def test_bad_extra_fields_json(self, tmp_db: Path, raw: str) -> None:
+        with pytest.raises(ToolError, match="invalid_field"):
+            add_card("Q", "A", extra_fields_json=raw)
+
+    def test_bulk_extra_fields(self, tmp_db: Path) -> None:
+        cards_json = json.dumps(
+            [
+                {"question": "Q1", "answer": "A1", "extra_fields": {"Source": "s"}},
+                {"question": "R", "answer": "S", "type": "reversed", "extra_fields": {"G": "m"}},
+            ]
+        )
+        result = add_cards_bulk(cards_json)
+        extras = [get_card(cid)["extra_fields"] for cid in result["created"]]
+        assert extras == [{"Source": "s"}, {"G": "m"}, {"G": "m"}]
+
+    def test_bulk_cloze_extra_fields_rejected(self, tmp_db: Path) -> None:
+        cards_json = json.dumps(
+            [{"question": "{{c1::x}} y", "type": "cloze", "extra_fields": {"S": "s"}}]
+        )
+        with pytest.raises(ToolError, match="bulk_input_error"):
+            add_cards_bulk(cards_json)
